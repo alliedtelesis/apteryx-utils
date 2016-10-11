@@ -33,6 +33,9 @@
 #include <syslog.h>
 #include <glib.h>
 
+/* Default UNIX socket path */
+#define APTERYX_SERVER  "unix:///tmp/apteryx"
+
 /* Debug */
 extern bool apteryx_debug;
 
@@ -96,15 +99,6 @@ static inline uint32_t htol32 (uint32_t v)
         rcode; \
     }
 
-#define FATAL(fmt, args...) \
-    { \
-        syslog (LOG_CRIT, fmt, ## args); \
-        fprintf (stderr, "[%"PRIu64":%d] ", get_time_us (), getpid ()); \
-        fprintf (stderr, "ERROR: "); \
-        fprintf (stderr, fmt, ## args); \
-        running = false; \
-    }
-
 #define CRITICAL(fmt, args...) \
     { \
         syslog (LOG_CRIT, fmt, ## args); \
@@ -112,5 +106,32 @@ static inline uint32_t htol32 (uint32_t v)
         fprintf (stderr, "ERROR: "); \
         fprintf (stderr, fmt, ## args); \
     }
+
+/* Callbacks */
+#define CB_MATCH_PART       (1<<0)
+#define CB_MATCH_EXACT      (1<<1)
+#define CB_MATCH_WILD       (1<<2)
+#define CB_MATCH_CHILD      (1<<3)
+#define CB_MATCH_WILD_PATH  (1<<4)
+#define CB_PATH_MATCH_PART  (1<<5)
+typedef struct _cb_info_t
+{
+    bool active;
+
+    const char *guid;
+    const char *path;
+    const char *uri;
+    uint64_t id;
+    uint64_t cb;
+
+    GList **list;
+    int refcnt;
+    uint32_t count;
+} cb_info_t;
+void cb_init (void);
+cb_info_t * cb_create (GList **list, const char *guid, const char *path, uint64_t id, uint64_t callback);
+void cb_destroy (cb_info_t *cb);
+void cb_release (cb_info_t *cb);
+GList *cb_match (GList **list, const char *path, int critera);
 
 #endif /* _COMMON_H_ */

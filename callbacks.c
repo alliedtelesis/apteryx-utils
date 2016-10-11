@@ -17,7 +17,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this library. If not, see <http://www.gnu.org/licenses/>
  */
-#include "internal.h"
+#include "common.h"
 #ifdef TEST
 #include <CUnit/CUnit.h>
 #include <CUnit/Basic.h>

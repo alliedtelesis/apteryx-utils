@@ -16,9 +16,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this library. If not, see <http://www.gnu.org/licenses/>
  */
-#include "common.h"
-#include "apteryx.h"
-#include "internal.h"
 #include <assert.h>
 #include <dirent.h>
 #include <libxml/parser.h>
@@ -36,6 +33,8 @@
 #include <CUnit/CUnit.h>
 #include <CUnit/Basic.h>
 #endif
+#include <apteryx.h>
+#include "common.h"
 
 /* Change the following to alfred*/
 #define APTERYX_ALFRED_PID "/var/run/apteryx-alfred.pid"
