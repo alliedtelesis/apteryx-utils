@@ -573,46 +573,59 @@ load_config_files (alfred_instance alfred, const char *path)
 GList *delayed_work = NULL;
 pthread_mutex_t delayed_work_lock = PTHREAD_MUTEX_INITIALIZER;
 
+struct delayed_work_s {
+    guint id;
+    char *script;
+};
+
 static gboolean
 delayed_work_process (gpointer arg1)
 {
-    char *script = (char *) arg1;
+    struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
     pthread_mutex_lock (&delayed_work_lock);
 
     /* Remove the script to be run */
-    delayed_work = g_list_remove (delayed_work, script);
+    delayed_work = g_list_remove (delayed_work, dw);
     pthread_mutex_unlock (&delayed_work_lock);
 
     /* Execute the script */
     pthread_mutex_lock (&alfred_inst->ls_lock);
-    alfred_exec (alfred_inst->ls, script);
+    alfred_exec (alfred_inst->ls, dw->script);
     pthread_mutex_unlock (&alfred_inst->ls_lock);
-    g_free (script);
+    g_free (dw->script);
+    g_free (dw);
     return false;
 }
 
 static void
-delayed_work_add (int delay, const char *script)
+delayed_work_add (int delay, const char *script, bool reset_timer)
 {
     bool found = false;
-    char *delay_script = NULL;
+    struct delayed_work_s *dw = NULL;
 
-    delay_script = g_strdup (script);
     pthread_mutex_lock (&delayed_work_lock);
     for (GList * iter = delayed_work; iter; iter = g_list_next (iter))
     {
-        char *script_list = (char *) iter->data;
-        if (strcmp (delay_script, script_list) == 0)
+        dw = (struct delayed_work_s *) iter->data;
+        if (strcmp (script, dw->script) == 0)
         {
             found = true;
-            g_free (delay_script);
+            if (reset_timer)
+            {
+                g_source_remove (dw->id);
+            }
             break;
         }
     }
     if (!found)
     {
-        delayed_work = g_list_append (delayed_work, delay_script);
-        g_timeout_add (delay, delayed_work_process, (gpointer) delay_script);
+        dw = (struct delayed_work_s *) g_malloc0 (sizeof (struct delayed_work_s));
+        dw->script = g_strdup (script);
+        delayed_work = g_list_append (delayed_work, dw);
+    }
+    if (!found || reset_timer)
+    {
+        dw->id = g_timeout_add (delay, delayed_work_process, (gpointer) dw);
     }
     pthread_mutex_unlock (&delayed_work_lock);
 }
@@ -642,7 +655,37 @@ rate_limit (lua_State *ls)
         return 0;
     }
 
-    delayed_work_add (lua_tonumber (ls, 1) * SECONDS_TO_MILLI, lua_tostring (ls, 2));
+    delayed_work_add (lua_tonumber (ls, 1) * SECONDS_TO_MILLI, lua_tostring (ls, 2), false);
+
+    return 0;
+}
+
+static int
+after_quiet (lua_State *ls)
+{
+    bool failure = false;
+    if (lua_gettop (ls) != 2)
+    {
+        ERROR ("Alfred.after_quiet() takes 2 arguements\n");
+        failure = true;
+    }
+    if (!lua_isnumber (ls, 1))
+    {
+        ERROR ("First argument to Alfred.after_quiet() must be a number\n");
+        failure = true;
+    }
+    if (!lua_isstring (ls, 2))
+    {
+        ERROR ("Second argument to Alfred.after_quiet() must be a string\n");
+        failure = true;
+    }
+
+    if (failure)
+    {
+        return 0;
+    }
+
+    delayed_work_add (lua_tonumber (ls, 1) * SECONDS_TO_MILLI, lua_tostring (ls, 2), true);
 
     return 0;
 }
@@ -711,10 +754,12 @@ alfred_init (const char *path)
         ERROR ("Lua: Failed to require('api')\n");
     }
 
-    /* Add the rate_limit function to a Lua table so it can be called using Lua */
+    /* Add the rate_limit,after_quiet functions to a Lua table so it can be called using Lua */
     lua_newtable (alfred_inst->ls);
     lua_pushcfunction (alfred_inst->ls, rate_limit);
     lua_setfield (alfred_inst->ls, -2, "rate_limit");
+    lua_pushcfunction (alfred_inst->ls, after_quiet);
+    lua_setfield (alfred_inst->ls, -2, "after_quiet");
     lua_setglobal (alfred_inst->ls, "Alfred");
 
     /* Parse files in the config path */
