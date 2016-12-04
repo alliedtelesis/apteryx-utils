@@ -41,8 +41,6 @@
 #define APTERYX_CONFIG_DIR "/etc/apteryx/schema/"
 #define SECONDS_TO_MILLI 1000
 
-#define alfred_lua_dostring(L, s) (luaL_loadstring(L, s) || lua_pcall(L, 0, 1, 0))
-
 /* Debug */
 bool apteryx_debug = false;
 
@@ -92,14 +90,14 @@ alfred_error (lua_State *ls, int res)
 }
 
 static bool
-alfred_exec (lua_State *ls, const char *script)
+alfred_exec (lua_State *ls, const char *script, int nresults)
 {
     int res = 0;
     int s_0 = lua_gettop (ls);
 
     res = luaL_loadstring (ls, script);
     if (res == 0)
-        res = lua_pcall (ls, 0, 0, 0);
+        res = lua_pcall (ls, 0, nresults, 0);
     if (res != 0)
         alfred_error (ls, res);
 
@@ -144,7 +142,7 @@ watch_node_changed (const char *path, const char *value)
             lua_setglobal (alfred_inst->ls, "_path");
             lua_pushstring (alfred_inst->ls, value);
             lua_setglobal (alfred_inst->ls, "_value");
-            ret = alfred_exec (alfred_inst->ls, script->data);
+            ret = alfred_exec (alfred_inst->ls, script->data, 0);
         }
     }
     g_list_free_full (matches, (GDestroyNotify) cb_release);
@@ -178,7 +176,7 @@ provide_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_lua_dostring (alfred_inst->ls, script)) != 0)
+    if ((alfred_exec (alfred_inst->ls, script, 1)) != 0)
     {
         ERROR ("Lua: Failed to execute provide script for path: %s\n", path);
     }
@@ -221,7 +219,7 @@ index_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_lua_dostring (alfred_inst->ls, script)) != 0)
+    if ((alfred_exec (alfred_inst->ls, script, 1)) != 0)
     {
         ERROR ("Lua: Failed to execute index script for path: %s\n", path);
     }
@@ -413,7 +411,7 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         content = xmlNodeGetContent (node);
         DEBUG ("XML: %s: %s\n", node->name, content);
         pthread_mutex_lock (&alfred->ls_lock);
-        ret = alfred_exec (alfred->ls, (char *) content);
+        ret = alfred_exec (alfred->ls, (char *) content, 0);
         pthread_mutex_unlock (&alfred->ls_lock);
         if (!ret)
         {
@@ -590,7 +588,7 @@ delayed_work_process (gpointer arg1)
 
     /* Execute the script */
     pthread_mutex_lock (&alfred_inst->ls_lock);
-    alfred_exec (alfred_inst->ls, dw->script);
+    alfred_exec (alfred_inst->ls, dw->script, 0);
     pthread_mutex_unlock (&alfred_inst->ls_lock);
     g_free (dw->script);
     g_free (dw);
@@ -749,7 +747,7 @@ alfred_init (const char *path)
         goto error;
     }
     luaL_openlibs (alfred_inst->ls);
-    if (alfred_lua_dostring (alfred_inst->ls, "require('api')") != 0)
+    if (alfred_exec (alfred_inst->ls, "require('api')", 0) != 0)
     {
         ERROR ("Lua: Failed to require('api')\n");
     }
