@@ -41,7 +41,7 @@
 #define APTERYX_CONFIG_DIR "/etc/apteryx/schema/"
 #define SECONDS_TO_MILLI 1000
 
-#define alfred_lua_dostring(L, s) (luaL_loadstring(L, s) || lua_pcall(L, 0, 1, 0))
+#define alfred_lua_dostring(L, s, c) (luaL_loadstring(L, s) || lua_pcall(L, 0, c, 0))
 
 /* Debug */
 bool apteryx_debug = false;
@@ -178,7 +178,7 @@ provide_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_lua_dostring (alfred_inst->ls, script)) != 0)
+    if ((alfred_lua_dostring (alfred_inst->ls, script, 1)) != 0)
     {
         ERROR ("Lua: Failed to execute provide script for path: %s\n", path);
     }
@@ -221,7 +221,7 @@ index_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_lua_dostring (alfred_inst->ls, script)) != 0)
+    if ((alfred_lua_dostring (alfred_inst->ls, script, 1)) != 0)
     {
         ERROR ("Lua: Failed to execute index script for path: %s\n", path);
     }
@@ -749,7 +749,7 @@ alfred_init (const char *path)
         goto error;
     }
     luaL_openlibs (alfred_inst->ls);
-    if (alfred_lua_dostring (alfred_inst->ls, "require('api')") != 0)
+    if (alfred_lua_dostring (alfred_inst->ls, "require('api')", 0) != 0)
     {
         ERROR ("Lua: Failed to require('api')\n");
     }
