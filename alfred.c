@@ -1112,7 +1112,7 @@ test_simple_index ()
 
     fprintf (library,
             "function test_library_function()\n"
-            "  return \"Goodnight light\", \"and the red balloon\"\n"
+            "  return {\"Goodnight light\", \"and the red balloon\"}\n"
             "end\n"
             );
     fclose (library);
@@ -1157,9 +1157,14 @@ test_simple_index ()
     paths = apteryx_search ("/test/");
 
     CU_ASSERT (g_list_length (paths) == 2);
-    CU_ASSERT (paths && strcmp ((char *) paths->data, "Goodnight light") == 0);
+    CU_ASSERT (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+               strcmp ((char *) paths->data, "and the red balloon") == 0));
     CU_ASSERT (paths && paths->next &&
-               strcmp (((char *) paths->next->data), "and the red balloon") == 0);
+               (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
+               strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+    CU_ASSERT (paths && paths->next &&
+               (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
+
     /* Clean up */
   cleanup:
     if (alfred_inst)
@@ -1245,9 +1250,13 @@ test_table_index ()
     paths = apteryx_search ("/test/");
 
     CU_ASSERT (g_list_length (paths) == 2);
-    CU_ASSERT (paths && strcmp ((char *) paths->data, "Goodnight light") == 0);
+    CU_ASSERT (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+               strcmp ((char *) paths->data, "and the red balloon") == 0));
     CU_ASSERT (paths && paths->next &&
-               strcmp (((char *) paths->next->data), "and the red balloon") == 0);
+               (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
+               strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+    CU_ASSERT (paths && paths->next &&
+               (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     /* Clean up */
   cleanup:
     if (alfred_inst)
