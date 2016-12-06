@@ -893,6 +893,192 @@ test_simple_watch ()
 }
 
 void
+test_rate_limit ()
+{
+    FILE *library = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    CU_ASSERT (library != NULL);
+    if (!library)
+    {
+        goto cleanup;
+    }
+
+    fprintf (library,
+            "function test_library_function(test_str)\n"
+            "  test_value = test_str\n"
+            "end\n"
+            );
+    fclose (library);
+    library = NULL;
+
+    data = fopen ("alfred_test.xml", "w");
+    CU_ASSERT (data != NULL);
+    if (!data)
+    {
+        goto cleanup;
+    }
+
+    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                   "  <SCRIPT>\n"
+                   "  function test_node_change(new_value)\n"
+                   "    test_library_function(new_value)\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                   "      <WATCH>Alfred.rate_limit(0.1, test_node_change(_value))</WATCH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+    fclose (data);
+    data = NULL;
+
+    /* Init */
+    alfred_init ("./");
+    CU_ASSERT (alfred_inst != NULL);
+    if (!alfred_inst)
+    {
+        goto cleanup;
+    }
+
+    /* Trigger Action */
+    apteryx_set ("/test/set_node", "Goodnight moon");
+    sleep (1);
+
+    /* Check output */
+    lua_getglobal (alfred_inst->ls, "test_value");
+    if (!lua_isnil (alfred_inst->ls, -1))
+    {
+        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+    }
+    lua_pop (alfred_inst->ls, 1);
+
+    CU_ASSERT (test_str && strcmp (test_str, "Goodnight moon") == 0);
+    apteryx_set ("/test/set_node", NULL);
+    /* Clean up */
+  cleanup:
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    if (library)
+    {
+        fclose (library);
+        unlink ("alfred_test.lua");
+    }
+    if (data)
+    {
+        fclose (data);
+        unlink ("alfred_test.xml");
+    }
+    if (test_str)
+    {
+        free (test_str);
+    }
+}
+
+void
+test_after_quiet ()
+{
+    FILE *library = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    CU_ASSERT (library != NULL);
+    if (!library)
+    {
+        goto cleanup;
+    }
+
+    fprintf (library,
+            "function test_library_function(test_str)\n"
+            "  test_value = test_str\n"
+            "end\n"
+            );
+    fclose (library);
+    library = NULL;
+
+    data = fopen ("alfred_test.xml", "w");
+    CU_ASSERT (data != NULL);
+    if (!data)
+    {
+        goto cleanup;
+    }
+
+    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                   "  <SCRIPT>\n"
+                   "  function test_node_change(new_value)\n"
+                   "    test_library_function(new_value)\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                   "      <WATCH>Alfred.after_quiet(0.1, test_node_change(_value))</WATCH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+    fclose (data);
+    data = NULL;
+
+    /* Init */
+    alfred_init ("./");
+    CU_ASSERT (alfred_inst != NULL);
+    if (!alfred_inst)
+    {
+        goto cleanup;
+    }
+
+    /* Trigger Action */
+    apteryx_set ("/test/set_node", "Goodnight moon");
+    sleep (1);
+
+    /* Check output */
+    lua_getglobal (alfred_inst->ls, "test_value");
+    if (!lua_isnil (alfred_inst->ls, -1))
+    {
+        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+    }
+    lua_pop (alfred_inst->ls, 1);
+
+    CU_ASSERT (test_str && strcmp (test_str, "Goodnight moon") == 0);
+    apteryx_set ("/test/set_node", NULL);
+    /* Clean up */
+  cleanup:
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    if (library)
+    {
+        fclose (library);
+        unlink ("alfred_test.lua");
+    }
+    if (data)
+    {
+        fclose (data);
+        unlink ("alfred_test.xml");
+    }
+    if (test_str)
+    {
+        free (test_str);
+    }
+}
+
+void
 test_dir_watch ()
 {
     FILE *library = NULL;
@@ -1275,6 +1461,8 @@ test_table_index ()
 
 static CU_TestInfo tests_alfred[] = {
     { "simple watch", test_simple_watch },
+    { "rate limit watch", test_rate_limit },
+    { "after quiet watch", test_after_quiet },
     { "directory watch", test_dir_watch },
     { "simple provide", test_simple_provide },
     { "simple index", test_simple_index },
