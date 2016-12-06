@@ -1271,6 +1271,209 @@ test_table_index ()
     }
 }
 
+/* Glib unit test */
+void
+test_rate_limit ()
+{
+    FILE *library = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    apteryx_init (false);
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (!library)
+    {
+        goto cleanup;
+    }
+
+    fprintf (library,
+            "function test_library_function(test_str)\n"
+            "  test_value = test_str\n"
+            "end\n"
+            );
+    fclose (library);
+    library = NULL;
+
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (!data)
+    {
+        goto cleanup;
+    }
+
+    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                   "  <SCRIPT>\n"
+                   "  function test_node_change(new_value)\n"
+                   "    test_library_function(new_value)\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                   "      <WATCH>Alfred.rate_limit(0.1,'test_node_change(_value)')</WATCH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+    fclose (data);
+    data = NULL;
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (!alfred_inst)
+    {
+        goto cleanup;
+    }
+
+    /* Trigger Action */
+    int count = 0;
+
+    while (count < 50)
+    {
+        apteryx_set ("/test/set_node", "Goodnight scoot");
+        count++;
+    }
+
+    sleep (1);
+    /* Check output */
+    lua_getglobal (alfred_inst->ls, "test_value");
+    if (!lua_isnil (alfred_inst->ls, -1))
+    {
+        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+    }
+    lua_pop (alfred_inst->ls, 1);
+
+    g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+    apteryx_set ("/test/set_node", NULL);
+    sleep(1);
+    /* Clean up */
+  cleanup:
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    if (library)
+    {
+        fclose (library);
+        unlink ("alfred_test.lua");
+    }
+    if (data)
+    {
+        fclose (data);
+        unlink ("alfred_test.xml");
+    }
+    if (test_str)
+    {
+        free (test_str);
+    }
+}
+
+/* Glib unit test */
+void
+test_after_quiet ()
+{
+    FILE *library = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    apteryx_init (false);
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (!library)
+    {
+        goto cleanup;
+    }
+    fprintf (library,
+            "function test_library_function(test_str)\n"
+            "  test_value = test_str\n"
+            "end\n"
+            );
+    fclose (library);
+    library = NULL;
+
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (!data)
+    {
+        goto cleanup;
+    }
+
+    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                   "  <SCRIPT>\n"
+                   "  function test_node_change(new_value)\n"
+                   "    test_library_function(new_value)\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                   "      <WATCH>Alfred.after_quiet(0.1,'test_node_change(_value)')</WATCH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+    fclose (data);
+    data = NULL;
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (!alfred_inst)
+    {
+        goto cleanup;
+    }
+
+    /* Trigger Action */
+    int count = 0;
+
+    while (count < 50)
+    {
+        apteryx_set ("/test/set_node", "Goodnight scoot");
+        count++;
+    }
+
+    sleep (1);
+    /* Check output */
+    lua_getglobal (alfred_inst->ls, "test_value");
+    if (!lua_isnil (alfred_inst->ls, -1))
+    {
+        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+    }
+    lua_pop (alfred_inst->ls, 1);
+
+    g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+    apteryx_set ("/test/set_node", NULL);
+    sleep(1);
+    /* Clean up */
+  cleanup:
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    if (library)
+    {
+        fclose (library);
+        unlink ("alfred_test.lua");
+    }
+    if (data)
+    {
+        fclose (data);
+        unlink ("alfred_test.xml");
+    }
+    if (test_str)
+    {
+        free (test_str);
+    }
+}
+
+
 static CU_TestInfo tests_alfred[] = {
     { "simple watch", test_simple_watch },
     { "directory watch", test_dir_watch },
@@ -1439,6 +1642,25 @@ main (int argc, char *argv[])
     if (unit_test)
     {
         run_unit_test (filter);
+
+        pthread_t main_thread;
+        pthread_attr_t attr;
+
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+        g_test_init (&argc, &argv, NULL);
+        g_test_add_func ("/test_rate_limit", test_rate_limit);
+        g_test_add_func ("/test_after_quiet", test_after_quiet);
+
+        loop = g_main_loop_new (NULL, true);
+        g_unix_signal_add (SIGINT, termination_handler, loop);
+        g_unix_signal_add (SIGTERM, termination_handler, loop);
+        pthread_create (&main_thread, &attr, (void *) g_main_loop_run, loop);
+        pthread_join(main_thread, NULL);
+        g_test_run();
+        pthread_cancel(main_thread);
+        pthread_attr_destroy(&attr);
         goto exit;
     }
     else
