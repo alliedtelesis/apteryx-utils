@@ -1114,7 +1114,7 @@ test_simple_index ()
 
     fprintf (library,
             "function test_library_function()\n"
-            "  return \"Goodnight light\", \"and the red balloon\"\n"
+            "  return {\"Goodnight light\", \"and the red balloon\"}\n"
             "end\n"
             );
     fclose (library);
