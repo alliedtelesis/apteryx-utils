@@ -576,6 +576,14 @@ struct delayed_work_s {
     char *script;
 };
 
+static void
+dw_destroy (gpointer arg1)
+{
+    struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
+    g_free (dw->script);
+    g_free (dw);
+}
+
 static gboolean
 delayed_work_process (gpointer arg1)
 {
@@ -590,8 +598,6 @@ delayed_work_process (gpointer arg1)
     pthread_mutex_lock (&alfred_inst->ls_lock);
     alfred_exec (alfred_inst->ls, dw->script, 0);
     pthread_mutex_unlock (&alfred_inst->ls_lock);
-    g_free (dw->script);
-    g_free (dw);
     return false;
 }
 
@@ -610,20 +616,19 @@ delayed_work_add (int delay, const char *script, bool reset_timer)
             found = true;
             if (reset_timer)
             {
+                delayed_work = g_list_remove (delayed_work, dw);
                 g_source_remove (dw->id);
             }
             break;
         }
     }
-    if (!found)
+    if (!found || reset_timer)
     {
         dw = (struct delayed_work_s *) g_malloc0 (sizeof (struct delayed_work_s));
         dw->script = g_strdup (script);
         delayed_work = g_list_append (delayed_work, dw);
-    }
-    if (!found || reset_timer)
-    {
-        dw->id = g_timeout_add (delay, delayed_work_process, (gpointer) dw);
+        dw->id = g_timeout_add_full (G_PRIORITY_DEFAULT, delay, delayed_work_process,
+                                     (gpointer) dw, dw_destroy);
     }
     pthread_mutex_unlock (&delayed_work_lock);
 }
