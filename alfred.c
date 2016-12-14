@@ -101,7 +101,7 @@ alfred_exec (lua_State *ls, const char *script, int nresults)
     if (res != 0)
         alfred_error (ls, res);
 
-    if (lua_gettop (ls) != s_0)
+    if (lua_gettop (ls) != (s_0 + nresults))
     {
         ERROR ("Lua: Stack not zero(%d) after script: %s\n",
                 lua_gettop (ls), script);
@@ -752,7 +752,7 @@ alfred_init (const char *path)
         goto error;
     }
     luaL_openlibs (alfred_inst->ls);
-    if (alfred_exec (alfred_inst->ls, "require('api')", 0) != 0)
+    if (luaL_dostring (alfred_inst->ls, "require('api')") != 0)
     {
         ERROR ("Lua: Failed to require('api')\n");
     }
