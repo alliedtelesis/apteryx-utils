@@ -176,7 +176,7 @@ provide_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_exec (alfred_inst->ls, script, 1)) != 0)
+    if (!alfred_exec (alfred_inst->ls, script, 1))
     {
         ERROR ("Lua: Failed to execute provide script for path: %s\n", path);
     }
@@ -219,7 +219,7 @@ index_node_changed (const char *path)
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
-    if ((alfred_exec (alfred_inst->ls, script, 1)) != 0)
+    if (!alfred_exec (alfred_inst->ls, script, 1))
     {
         ERROR ("Lua: Failed to execute index script for path: %s\n", path);
     }
