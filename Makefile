@@ -41,11 +41,15 @@ EXTRA_CFLAGS += -DTEST
 EXTRA_LDFLAGS += -lcunit
 endif
 
-all: apteryx-sync alfred
+all: apteryx-sync alfred saver
 
 %.o: %.c
 	@echo "Compiling "$<""
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+saver: saver.o
+	@echo "Building $@"
+	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $^ $(EXTRA_LDFLAGS) -lapteryx-schema
 
 apteryx-sync: syncer.c
 	@echo "Building $@"
@@ -80,9 +84,10 @@ install: all
 	@install -d $(DESTDIR)/$(PREFIX)/bin
 	@install -D apteryx-sync $(DESTDIR)/$(PREFIX)/bin/
 	@install -D alfred $(DESTDIR)/$(PREFIX)/bin/
+	@install -D saver $(DESTDIR)/$(PREFIX)/bin/
 
 clean:
 	@echo "Cleaning..."
-	$(Q)rm -f apteryx-sync alfred *.o
+	$(Q)rm -f apteryx-sync alfred saver *.o
 
 .PHONY: all clean
