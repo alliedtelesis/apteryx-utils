@@ -455,6 +455,11 @@ periodic_syncer_thread (void *ign)
 bool
 new_change (const char *path, const char *value)
 {
+    if (sync_path_excluded (path))
+    {
+        DEBUG ("Ignoring EXCLUDED_CHANGE on path %s, value %s\n", path, value);
+        return false;
+    }
     DEBUG ("Pushing NEW_CHANGE on path %s, value %s to cache\n", path, value);
     add_data_point (path, value);
     return true;
