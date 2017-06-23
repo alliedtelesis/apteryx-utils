@@ -1498,7 +1498,7 @@ static CU_TestInfo tests_alfred[] = {
 };
 
 static CU_SuiteInfo suites[] = {
-    { "Alfred", suite_init, suite_clean, tests_alfred },
+    { "Alfred", suite_init, suite_clean, NULL, NULL, tests_alfred },
     CU_SUITE_INFO_NULL,
 };
 
