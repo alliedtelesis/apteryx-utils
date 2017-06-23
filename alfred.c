@@ -1619,9 +1619,6 @@ main (int argc, char *argv[])
         case 'c':
             config_dir = optarg;
             break;
-        case 'm':
-            g_mem_set_vtable (glib_mem_profiler_table);
-            break;
 #ifdef TEST
         case 'u':
             unit_test = true;
