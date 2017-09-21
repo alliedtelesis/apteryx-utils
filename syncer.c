@@ -411,11 +411,6 @@ resync ()
                     apteryx_set_tree (data);
                 }
             }
-            else
-            {
-                /* These ones will have got all the data above */
-                sp->new_joiner = false;
-            }
         }
     }
 
@@ -423,6 +418,13 @@ resync ()
     {
         apteryx_free_tree (data);
         data = NULL;
+    }
+
+    for (iter = partners; iter; iter = iter->next)
+    {
+        /* All partners are now up to date */
+        sync_partner *sp = iter->data;
+        sp->new_joiner = false;
     }
 
     last_sync_local = local_ts;
