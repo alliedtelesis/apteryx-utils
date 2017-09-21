@@ -355,7 +355,8 @@ resync ()
 {
     /* Called under a lock */
     GList *iter;
-    GNode *data = NULL;
+    GNode *new_data = NULL;
+    GNode *sync_data = NULL;
     static uint64_t last_sync_local = 0;
 
     uint64_t local_ts = apteryx_timestamp ("/");
@@ -363,9 +364,10 @@ resync ()
     for (iter = partners; iter; iter = iter->next)
     {
         sync_partner *sp = iter->data;
+        /* Sync the entire tree to new partners */
         if (sp->new_joiner)
         {
-            if (data == NULL)
+            if (new_data == NULL)
             {
                 data = APTERYX_NODE (NULL, strdup ("/"));
                 /* Get everything */
@@ -382,28 +384,19 @@ resync ()
                     apteryx_set_tree (data);
                 }
             }
+            sp->new_joiner = false;
         }
-    }
-
-    if (data)
-    {
-        apteryx_free_tree (data);
-        data = NULL;
-    }
-
-    /* Grab all the data that has been added since the last update... */
-    data = APTERYX_NODE (NULL, strdup ("/"));
-    sync_gather (data, last_sync_local);
-
-    if (APTERYX_NUM_NODES (data) > 0)
-    {
-        for (iter = partners; iter; iter = iter->next)
+        else
         {
-            sync_partner *sp = iter->data;
-            if (!sp->new_joiner)
+            /* Sync changes since the last timestamp to existing partners */
+            if (sync_data == NULL)
+            {
+                sync_data = APTERYX_NODE (NULL, strdup ("/"));
+                sync_gather (sync_data, last_sync_local);
+            }
+            if (APTERYX_NUM_NODES (sync_data) > 0)
             {
                 char *next_path = NULL;
-
                 if (asprintf (&next_path, "%s:/", sp->socket) > 0)
                 {
                     free (data->data);
@@ -411,18 +404,16 @@ resync ()
                     apteryx_set_tree (data);
                 }
             }
-            else
-            {
-                /* These ones will have got all the data above */
-                sp->new_joiner = false;
-            }
         }
     }
 
-    if (data)
+    if (new_data)
     {
         apteryx_free_tree (data);
-        data = NULL;
+    }
+    if (sync_data)
+    {
+        apteryx_free_tree (data);
     }
 
     last_sync_local = local_ts;
