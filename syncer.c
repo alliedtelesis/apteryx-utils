@@ -224,9 +224,27 @@ bool
 sync_path_excluded (const char *path)
 {
     pthread_rwlock_rdlock (&paths_lock);
+    int len;
+    char *exclude_path;
+    int ret;
+
     for (GList *iter = excluded_paths; iter; iter = iter->next)
     {
-        if (strcmp (path, iter->data) == 0)
+        exclude_path = (char *) iter->data;
+        len = strlen (exclude_path);
+
+        if (len && exclude_path[len - 1] == '*')
+        {
+            /* Match all paths beginning with this string */
+            ret = strncmp (path, exclude_path, len - 1);
+        }
+        else
+        {
+            /* Match exact path */
+            ret = strcmp (path, exclude_path);
+        }
+
+        if (ret == 0)
         {
             pthread_rwlock_unlock (&paths_lock);
             return true;
