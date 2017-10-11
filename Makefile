@@ -85,6 +85,8 @@ install: all
 	@install -D apteryx-sync $(DESTDIR)/$(PREFIX)/bin/
 	@install -D alfred $(DESTDIR)/$(PREFIX)/bin/
 	@install -D saver $(DESTDIR)/$(PREFIX)/bin/
+	@install -d $(DESTDIR)/$(PREFIX)/include
+	@install -D apteryx_sync.h $(DESTDIR)/$(PREFIX)/include/
 
 clean:
 	@echo "Cleaning..."

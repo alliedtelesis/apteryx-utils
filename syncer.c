@@ -7,6 +7,7 @@
 #include <apteryx.h>
 #include <glib-unix.h>
 #include "common.h"
+#include "apteryx_sync.h"
 
 #define APTERYX_SYNC_PID "/var/run/apteryx-sync.pid"
 #define APTERYX_SYNC_CONFIG_DIR "/etc/apteryx/sync/"
@@ -224,9 +225,27 @@ bool
 sync_path_excluded (const char *path)
 {
     pthread_rwlock_rdlock (&paths_lock);
+    int len;
+    char *exclude_path;
+    int ret;
+
     for (GList *iter = excluded_paths; iter; iter = iter->next)
     {
-        if (strcmp (path, iter->data) == 0)
+        exclude_path = (char *) iter->data;
+        len = strlen (exclude_path);
+
+        if (len && exclude_path[len - 1] == '*')
+        {
+            /* Match all paths beginning with this string */
+            ret = strncmp (path, exclude_path, len - 1);
+        }
+        else
+        {
+            /* Match exact path */
+            ret = strcmp (path, exclude_path);
+        }
+
+        if (ret == 0)
         {
             pthread_rwlock_unlock (&paths_lock);
             return true;
@@ -458,26 +477,20 @@ register_existing_partners (void)
 {
     GList *iter = NULL;
     char *value = NULL;
-    char *path = NULL;
-    /* get all paths under the APTERYX_SYNC_PATH node
+
+    /* get all paths under the APTERYX_SYNC_DESTINATIONS_PATH node
      * note: need to add a "/" on the end for search to work
      */
-    GList *existing_partners = apteryx_search (APTERYX_SYNC_PATH "/");
+    GList *existing_partners = apteryx_search (APTERYX_SYNC_DESTINATIONS_PATH "/");
     /* for each path in the search result, get the value and create a new syncer */
     iter = existing_partners;
     while (iter != NULL)
     {
         DEBUG ("Adding existing partner %s\n", (char *) iter->data);
-        /* the path is a char* in the iter->data. need to add "/*" to the end */
-        if (asprintf (&path, "%s/*", (char *) iter->data) <= 0)
-        {
-            /* shouldn't fail, but if it does we can't do any more with it */
-            continue;
-        }
-        value = apteryx_get (path);
-        new_syncer (path, value);
+        value = apteryx_get (iter->data);
+        new_syncer (iter->data, value);
         free (value);
-        free (path);
+
         /* finished with this entry. move along, nothing to see here. */
         iter = iter->next;
     }
@@ -685,7 +698,7 @@ main (int argc, char *argv[])
     }
 
     /* The sync path is how applications can register the nodes to sync to */
-    apteryx_watch (APTERYX_SYNC_PATH "/*", new_syncer);
+    apteryx_watch (APTERYX_SYNC_DESTINATIONS_PATH "/*", new_syncer);
 
     /* next, we need to check for any existing nodes and setup syncers for them */
     register_existing_partners ();
