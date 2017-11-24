@@ -30,7 +30,7 @@ else
 EXTRA_CFLAGS += -I$(APTERYX_PATH)
 EXTRA_LDFLAGS += -L$(APTERYX_PATH) -lapteryx
 endif
-LUAVERSION := $(shell $(PKG_CONFIG) --exists lua && echo lua || ($(PKG_CONFIG) --exists lua5.2 && echo lua5.2 || echo none))
+LUAVERSION := $(shell $(PKG_CONFIG) --exists lua && echo lua || ($(PKG_CONFIG) --exists lua5.2 && echo lua5.2 || ($(PKG_CONFIG) --exists lua5.3 && echo lua5.3 || echo none)))
 EXTRA_CFLAGS += -DHAVE_LUA $(shell $(PKG_CONFIG) --cflags $(LUAVERSION))
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs $(LUAVERSION)) -ldl
 EXTRA_CFLAGS += -DHAVE_LIBXML2 $(shell $(PKG_CONFIG) --cflags libxml-2.0)
