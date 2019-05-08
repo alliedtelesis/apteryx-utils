@@ -18,6 +18,7 @@ CC:=$(CROSS_COMPILE)gcc
 LD:=$(CROSS_COMPILE)ld
 PKG_CONFIG ?= pkg-config
 APTERYX_PATH ?=
+APTERYX_XML_PATH ?=
 
 CFLAGS := $(CFLAGS) -g -O2
 EXTRA_CFLAGS += -Wall -Wno-comment -std=c99 -D_GNU_SOURCE -fPIC
@@ -30,6 +31,10 @@ else
 EXTRA_CFLAGS += -I$(APTERYX_PATH)
 EXTRA_LDFLAGS += -L$(APTERYX_PATH) -lapteryx
 endif
+ifdef APTERYX_XML_PATH
+EXTRA_CFLAGS += -I$(APTERYX_XML_PATH)
+EXTRA_LDFLAGS += -L$(APTERYX_XML_PATH)
+endif
 LUAVERSION := $(shell $(PKG_CONFIG) --exists lua && echo lua || ($(PKG_CONFIG) --exists lua5.2 && echo lua5.2 || echo none))
 EXTRA_CFLAGS += -DHAVE_LUA $(shell $(PKG_CONFIG) --cflags $(LUAVERSION))
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs $(LUAVERSION)) -ldl
@@ -41,13 +46,13 @@ EXTRA_CFLAGS += -DTEST
 EXTRA_LDFLAGS += -lcunit
 endif
 
-all: apteryx-sync alfred saver
+all: alfred apteryx-sync apteryx-saver
 
 %.o: %.c
 	@echo "Compiling "$<""
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
-saver: saver.o
+apteryx-saver: saver.o
 	@echo "Building $@"
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $^ $(EXTRA_LDFLAGS) -lapteryx-schema
 
@@ -84,7 +89,7 @@ install: all
 	@install -d $(DESTDIR)/$(PREFIX)/bin
 	@install -D apteryx-sync $(DESTDIR)/$(PREFIX)/bin/
 	@install -D alfred $(DESTDIR)/$(PREFIX)/bin/
-	@install -D saver $(DESTDIR)/$(PREFIX)/bin/
+	@install -D apteryx-saver $(DESTDIR)/$(PREFIX)/bin/
 	@install -d $(DESTDIR)/$(PREFIX)/include
 	@install -D apteryx_sync.h $(DESTDIR)/$(PREFIX)/include/
 
