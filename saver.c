@@ -23,9 +23,12 @@
 #include <glib-unix.h>
 #include <syslog.h>
 
-#define DEBUG(fmt, args...) //printf (fmt, ## args);
+#define DEBUG(fmt, args...) { if (apteryx_debug) printf (fmt, ## args); }
+#define INFO(fmt, args...) syslog (LOG_INFO, fmt, ## args);
+#define ERROR(fmt, args...) syslog (LOG_ERR, fmt, ## args);
 
-#define APTERYX_CONFIG_DIR "/etc/apteryx/schema/"
+#define APTERYX_SCHEMA_DIR "/etc/apteryx/schema/"
+#define APTERYX_CONFIG_DIR "/etc/apteryx/saver/"
 #define APTERYX_SAVE_PID "/var/run/saver.pid"
 #define APTERYX_SAVE_CONFIG_FILE "/etc/apteryx/saver.cfg"
 
@@ -34,6 +37,7 @@ static GNode *saver_nodes = NULL;
 static GNode *config_nodes = NULL;
 static int write_delay = 15;
 static bool automatic = false;
+const char *schema_dir = APTERYX_SCHEMA_DIR;
 const char *config_dir = APTERYX_CONFIG_DIR;
 const char *config_file = APTERYX_SAVE_CONFIG_FILE;
 static bool writing = false;
@@ -153,9 +157,9 @@ process_node (xmlNode *node, char *parent)
         {
             path = g_strdup_printf ("/%s", name);
         }
-        DEBUG ("XML: %s: %s (%s)\n", node->name, name, path);
         if (sch_is_config (node))
         {
+            DEBUG ("Schema: %s\n", path);
             _path_to_node (saver_nodes, path, NULL);
         }
     }
@@ -175,6 +179,74 @@ process_node (xmlNode *node, char *parent)
     return res;
 }
 
+bool
+parse_config_files (const char* config_dir)
+{
+    FILE *fp = NULL;
+    struct dirent *config_file;
+    DIR *dp = NULL;
+    char *config_file_name = NULL;
+
+    /* open the sync config dir and read all the files in it to get sync paths */
+    dp = opendir (config_dir);
+    if (!dp)
+    {
+        ERROR ("Couldn't open saver config directory \"%s\"\n", config_dir);
+        return FALSE;
+    }
+    /* Now read the config file(s) to know which paths should be synced */
+    while ((config_file = readdir(dp)) != NULL)
+    {
+        if ((strcmp(config_file->d_name, ".") == 0) ||
+            (strcmp(config_file->d_name, "..") == 0))
+        {
+            /* skip the directory entries */
+            continue;
+        }
+        if (asprintf (&config_file_name, "%s/%s", config_dir, config_file->d_name) == -1)
+        {
+            /* this shouldn't fail, but can't do anything if it does */
+            continue;
+        }
+        fp = fopen (config_file_name, "r");
+        if (!fp)
+        {
+            ERROR ("Couldn't open saver config file \"%s\"\n", config_file_name);
+        }
+        else
+        {
+            char *path = NULL;
+            char *newline = NULL;
+            size_t n = 0;
+
+            DEBUG ("Parsing %s\n", config_file_name);
+
+            while (getline (&path, &n, fp) != -1)
+            {
+                /* ignore empty lines or lines starting with '#' */
+                if (path[0] == '#' || path[0] == '\n')
+                {
+                    free (path);
+                    path = NULL;
+                    continue;
+                }
+                if ((newline = strchr (path, '\n')) != NULL)
+                {
+                    newline[0] = '\0'; // remove the trailing newline char
+                }
+                DEBUG ("Config: %s\n", path);
+                _path_to_node (saver_nodes, path, NULL);
+                free (path);
+                path = NULL;
+            }
+            fclose (fp);
+        }
+        free (config_file_name);
+    }
+    closedir (dp);
+    return TRUE;
+}
+
 static gboolean
 write_line (GNode *node, gpointer data)
 {
@@ -192,6 +264,8 @@ _write_config ()
 {
     FILE *data = NULL;
     char *old_root_name = NULL;
+
+    INFO ("Writing %s\n", config_file);
 
     /* Create file */
     data = fopen (config_file, "w");
@@ -511,12 +585,13 @@ termination_handler (gpointer arg1)
 void
 help (char *app_name)
 {
-    printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-c <configdir>] [-u <filter>] [-w <writedelay>]\n"
+    printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-s <schemadir>] [-c <configdir>] [-u <filter>] [-w <writedelay>]\n"
             "  -h   show this help\n"
             "  -b   background mode\n"
             "  -d   enable verbose debug\n"
             "  -p   use <pidfile> (defaults to " APTERYX_SAVE_PID ")\n"
-            "  -c   use <configdir> to search for schemas (defaults to " APTERYX_CONFIG_DIR ")\n"
+            "  -s   use <schemadir> to search for schemas (defaults to " APTERYX_SCHEMA_DIR ")\n"
+            "  -c   use <configdir> to search for config files (defaults to " APTERYX_CONFIG_DIR ")\n"
             "  -f   use <configfile> for saving configuration (defaults to " APTERYX_SAVE_CONFIG_FILE ")\n"
             "  -w   set write delay (defaults to 15 seconds)\n"
             "  -l   load in configuration at startup\n"
@@ -541,19 +616,23 @@ main (int argc, char *argv[])
     apteryx_init (false);
 
     /* Parse options */
-    while ((i = getopt (argc, argv, "hdbp:c:uaw:f:l")) != -1)
+    while ((i = getopt (argc, argv, "hdbp:s:c:uaw:f:l")) != -1)
     {
         switch (i)
         {
         case 'd':
             apteryx_debug = true;
             background = false;
+            setvbuf (stdout, NULL, _IONBF, 0);
             break;
         case 'b':
             background = true;
             break;
         case 'p':
             pid_file = optarg;
+            break;
+        case 's':
+            schema_dir = optarg;
             break;
         case 'c':
             config_dir = optarg;
@@ -636,8 +715,9 @@ main (int argc, char *argv[])
     }
 
     saver_nodes = g_node_new (g_strdup("/"));
-    schemas = sch_load (config_dir);
+    schemas = sch_load (schema_dir);
     process_node (schemas, NULL);
+    parse_config_files (config_dir);
     if (load_startup_config)
     {
         load_config ();
