@@ -290,9 +290,15 @@ write_config_process (gpointer arg1)
     writing = false;
     pthread_mutex_unlock (&writing_lock);
     pthread_mutex_lock (&config_lock);
+    if (!automatic)
+    {
+        if (config_nodes)
+            apteryx_free_tree (config_nodes);
+        config_nodes = apteryx_query (saver_nodes);
+    }
     _write_config ();
     pthread_mutex_unlock (&config_lock);
-    return false;
+    return G_SOURCE_CONTINUE;
 }
 
 void
@@ -659,7 +665,7 @@ main (int argc, char *argv[])
             config_file = optarg;
             break;
         case 'l':
-          load_startup_config = true;
+            load_startup_config = true;
             break;
         case '?':
         case 'h':
