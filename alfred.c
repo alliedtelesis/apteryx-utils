@@ -58,6 +58,7 @@ typedef struct alfred_instance_t *alfred_instance;
 
 /* The one and only instance */
 alfred_instance alfred_inst = NULL;
+static int alfred_apteryx_fd = -1;
 
 static void
 alfred_error (lua_State *ls, int res)
@@ -748,6 +749,10 @@ alfred_init (const char *path)
         goto error;
     }
     luaL_openlibs (alfred_inst->ls);
+    if (luaL_dostring (alfred_inst->ls, "apteryx = require('apteryx')") != 0)
+    {
+        ERROR ("Lua: Failed to require('apteryx')\n");
+    }
     if (luaL_dostring (alfred_inst->ls, "require('api')") != 0)
     {
         ERROR ("Lua: Failed to require('api')\n");
@@ -1471,6 +1476,20 @@ test_after_quiet ()
 }
 
 static gboolean
+process_apteryx (GIOChannel *source, GIOCondition condition, gpointer data)
+{
+    assert (alfred_inst);
+    luaL_loadstring (alfred_inst->ls, "apteryx.process()");
+    lua_pcall (alfred_inst->ls, 0, 0, 0);
+    uint8_t dummy = 0;
+    if (read (alfred_apteryx_fd, &dummy, 1) == 0)
+    {
+        ERROR ("Poll/Read error: %s\n", strerror (errno));
+    }
+    return true;
+}
+
+static gboolean
 termination_handler (gpointer arg1)
 {
     GMainLoop *loop = (GMainLoop *) arg1;
@@ -1538,8 +1557,11 @@ main (int argc, char *argv[])
         return 0;
     }
 
-    /* Initialise Apteryx client library */
+    /* Initialise Apteryx client library in single threaded mode */
     apteryx_init (apteryx_debug);
+    alfred_apteryx_fd = apteryx_process (true);
+    g_io_add_watch (g_io_channel_unix_new (alfred_apteryx_fd),
+                    G_IO_IN, process_apteryx, NULL);
 
     cb_init ();
 
