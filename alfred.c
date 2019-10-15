@@ -45,8 +45,6 @@ struct alfred_instance_t
 {
     /* Lua state */
     lua_State *ls;
-    /* Lock for Lua state */
-    pthread_mutex_t ls_lock;
     /* List of watches based on path */
     GList *watches;
     /* List of provides based on path */
@@ -128,7 +126,6 @@ watch_node_changed (const char *path, const char *value)
         return false;
     }
 
-    pthread_mutex_lock (&alfred_inst->ls_lock);
     for (node = g_list_first (matches); node != NULL; node = g_list_next (node))
     {
         cb = node->data;
@@ -145,7 +142,6 @@ watch_node_changed (const char *path, const char *value)
     g_list_free_full (matches, (GDestroyNotify) cb_release);
     DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (alfred_inst->ls),
             lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
-    pthread_mutex_unlock (&alfred_inst->ls_lock);
     DEBUG ("ALFRED WATCH: %s = %s\n", path, value);
     return ret;
 }
@@ -167,7 +163,6 @@ provide_node_changed (const char *path)
         return NULL;
     }
 
-    pthread_mutex_lock (&alfred_inst->ls_lock);
     cb = g_list_first (matches)->data;
     script = (char *) (long) cb->cb;
     lua_pushstring (alfred_inst->ls, path);
@@ -189,7 +184,6 @@ provide_node_changed (const char *path)
         ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
                 lua_gettop (alfred_inst->ls), path);
     }
-    pthread_mutex_unlock (&alfred_inst->ls_lock);
     return ret;
 }
 
@@ -212,7 +206,6 @@ index_node_changed (const char *path)
     }
     cb = g_list_first (matches)->data;
     script = (char *) (long) cb->cb;
-    pthread_mutex_lock (&alfred_inst->ls_lock);
     lua_pushstring (alfred_inst->ls, path);
     lua_setglobal (alfred_inst->ls, "_path");
     s_0 = lua_gettop (alfred_inst->ls);
@@ -245,7 +238,6 @@ index_node_changed (const char *path)
         ERROR ("Lua: Stack not zero(%d) after index: %s\n",
                 lua_gettop (alfred_inst->ls), path);
     }
-    pthread_mutex_unlock (&alfred_inst->ls_lock);
     return ret;
 }
 
@@ -407,9 +399,7 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         bool ret = false;
         content = xmlNodeGetContent (node);
         DEBUG ("XML: %s: %s\n", node->name, content);
-        pthread_mutex_lock (&alfred->ls_lock);
         ret = alfred_exec (alfred->ls, (char *) content, 0);
-        pthread_mutex_unlock (&alfred->ls_lock);
         if (!ret)
         {
             res = false;
@@ -505,7 +495,6 @@ load_config_files (alfred_instance alfred, const char *path)
             DEBUG ("ALFRED: Load Lua file \"%s\"\n", filename);
 
             /* Execute the script */
-            pthread_mutex_lock (&alfred->ls_lock);
             lua_getglobal (alfred->ls, "debug");
             lua_getfield (alfred->ls, -1, "traceback");
             error = luaL_loadfile (alfred->ls, filename);
@@ -517,8 +506,6 @@ load_config_files (alfred_instance alfred, const char *path)
 
             while (lua_gettop (alfred->ls))
                 lua_pop (alfred->ls, 1);
-
-            pthread_mutex_unlock (&alfred->ls_lock);
 
             /* Stop processing files if there has been an error */
             if (error != 0)
@@ -566,8 +553,6 @@ load_config_files (alfred_instance alfred, const char *path)
 }
 
 GList *delayed_work = NULL;
-pthread_mutex_t delayed_work_lock = PTHREAD_MUTEX_INITIALIZER;
-
 struct delayed_work_s {
     guint id;
     char *script;
@@ -585,16 +570,12 @@ static gboolean
 delayed_work_process (gpointer arg1)
 {
     struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
-    pthread_mutex_lock (&delayed_work_lock);
 
     /* Remove the script to be run */
     delayed_work = g_list_remove (delayed_work, dw);
-    pthread_mutex_unlock (&delayed_work_lock);
 
     /* Execute the script */
-    pthread_mutex_lock (&alfred_inst->ls_lock);
     alfred_exec (alfred_inst->ls, dw->script, 0);
-    pthread_mutex_unlock (&alfred_inst->ls_lock);
     return false;
 }
 
@@ -604,7 +585,6 @@ delayed_work_add (int delay, const char *script, bool reset_timer)
     bool found = false;
     struct delayed_work_s *dw = NULL;
 
-    pthread_mutex_lock (&delayed_work_lock);
     for (GList * iter = delayed_work; iter; iter = g_list_next (iter))
     {
         dw = (struct delayed_work_s *) iter->data;
@@ -627,7 +607,6 @@ delayed_work_add (int delay, const char *script, bool reset_timer)
         dw->id = g_timeout_add_full (G_PRIORITY_DEFAULT, delay, delayed_work_process,
                                      (gpointer) dw, dw_destroy);
     }
-    pthread_mutex_unlock (&delayed_work_lock);
 }
 
 static int
@@ -738,8 +717,6 @@ alfred_init (const char *path)
         CRITICAL ("ALFRED: No memory for alfred instance\n");
         goto error;
     }
-
-    pthread_mutex_init (&alfred_inst->ls_lock, NULL);
 
     /* Initialise the Lua state */
     alfred_inst->ls = luaL_newstate ();
