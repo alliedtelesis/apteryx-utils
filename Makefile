@@ -1,7 +1,7 @@
 # Makefile for Apteryx
 #
 # Unit Tests (make test FILTER): e.g make test Alfred
-# Requires GLib, Lua and libXML2. CUnit for Unit Testing.
+# Requires GLib, Lua and libXML2.
 # sudo apt-get install libglib2.0-dev liblua5.2-dev libxml2-dev libcunit1-dev
 #
 # TEST_WRAPPER="G_SLICE=always-malloc valgrind --leak-check=full" make test
@@ -40,11 +40,6 @@ EXTRA_CFLAGS += -DHAVE_LUA $(shell $(PKG_CONFIG) --cflags $(LUAVERSION))
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs $(LUAVERSION)) -ldl
 EXTRA_CFLAGS += -DHAVE_LIBXML2 $(shell $(PKG_CONFIG) --cflags libxml-2.0)
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs libxml-2.0)
-ifneq ($(HAVE_TESTS),no)
-EXTRA_CSRC += test.c
-EXTRA_CFLAGS += -DTEST
-EXTRA_LDFLAGS += -lcunit
-endif
 
 all: alfred apteryx-sync apteryx-saver
 
@@ -74,14 +69,9 @@ apteryxd = \
 	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./ $(TEST_WRAPPER) ./$(1); \
 	kill -TERM `cat /tmp/apteryxd.pid`;
 
-ifeq (test,$(firstword $(MAKECMDGOALS)))
-TEST_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
-$(eval $(TEST_ARGS):;@:)
-endif
-
 test: alfred
 	@echo "Running unit test: $<"
-	$(Q)$(call apteryxd,alfred -u$(TEST_ARGS))
+	$(Q)$(call apteryxd,alfred -u)
 	$(Q)rm -f alfred_test.xml alfred_test.lua
 	@echo "Tests have been run!"
 

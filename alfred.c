@@ -29,10 +29,6 @@
 #include <glib.h>
 #include <glib-unix.h>
 #include <lua.h>
-#ifdef TEST
-#include <CUnit/CUnit.h>
-#include <CUnit/Basic.h>
-#endif
 #include <apteryx.h>
 #include "common.h"
 
@@ -789,19 +785,6 @@ error:
     return;
 }
 
-#ifdef TEST
-static int
-suite_init (void)
-{
-    return 0;
-}
-
-static int
-suite_clean (void)
-{
-    return 0;
-}
-
 void
 test_simple_watch ()
 {
@@ -811,7 +794,7 @@ test_simple_watch ()
 
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
-    CU_ASSERT (library != NULL);
+    g_assert (library != NULL);
     if (!library)
     {
         goto cleanup;
@@ -826,7 +809,7 @@ test_simple_watch ()
     library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
-    CU_ASSERT (data != NULL);
+    g_assert (data != NULL);
     if (!data)
     {
         goto cleanup;
@@ -853,7 +836,7 @@ test_simple_watch ()
 
     /* Init */
     alfred_init ("./");
-    CU_ASSERT (alfred_inst != NULL);
+    g_assert (alfred_inst != NULL);
     if (!alfred_inst)
     {
         goto cleanup;
@@ -871,7 +854,7 @@ test_simple_watch ()
     }
     lua_pop (alfred_inst->ls, 1);
 
-    CU_ASSERT (test_str && strcmp (test_str, "Goodnight moon") == 0);
+    g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
     apteryx_set ("/test/set_node", NULL);
     /* Clean up */
   cleanup:
@@ -905,7 +888,7 @@ test_dir_watch ()
 
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
-    CU_ASSERT (library != NULL);
+    g_assert (library != NULL);
     if (!library)
     {
         goto cleanup;
@@ -921,7 +904,7 @@ test_dir_watch ()
     library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
-    CU_ASSERT (data != NULL);
+    g_assert (data != NULL);
     if (!data)
     {
         goto cleanup;
@@ -950,7 +933,7 @@ test_dir_watch ()
 
     /* Init */
     alfred_init ("./");
-    CU_ASSERT (alfred_inst != NULL);
+    g_assert (alfred_inst != NULL);
     if (!alfred_inst)
         goto cleanup;
 
@@ -968,8 +951,8 @@ test_dir_watch ()
         test_path = strdup (lua_tostring (alfred_inst->ls, -1));
     lua_pop (alfred_inst->ls, 1);
 
-    CU_ASSERT (test_path && strcmp (test_path, "/test/set_node") == 0);
-    CU_ASSERT (test_str && strcmp (test_str, "Goodnight cow jumping over the moon") == 0);
+    g_assert (test_path && strcmp (test_path, "/test/set_node") == 0);
+    g_assert (test_str && strcmp (test_str, "Goodnight cow jumping over the moon") == 0);
     free (test_path);
     free (test_str);
 
@@ -988,8 +971,8 @@ test_dir_watch ()
         test_path = strdup (lua_tostring (alfred_inst->ls, -1));
     lua_pop (alfred_inst->ls, 1);
 
-    CU_ASSERT (test_path && strcmp (test_path, "/test/deeper/set_node") == 0);
-    CU_ASSERT (test_str && strcmp (test_str, "Goodnight bears") == 0);
+    g_assert (test_path && strcmp (test_path, "/test/deeper/set_node") == 0);
+    g_assert (test_str && strcmp (test_str, "Goodnight bears") == 0);
 
     apteryx_set ("/test/set_node", NULL);
     apteryx_set ("/test/deeper/set_node", NULL);
@@ -1030,7 +1013,7 @@ test_simple_provide ()
 
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
-    CU_ASSERT (library != NULL);
+    g_assert (library != NULL);
     if (!library)
         goto cleanup;
 
@@ -1043,7 +1026,7 @@ test_simple_provide ()
     library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
-    CU_ASSERT (data != NULL);
+    g_assert (data != NULL);
     if (!data)
         goto cleanup;
 
@@ -1068,14 +1051,14 @@ test_simple_provide ()
 
     /* Init */
     alfred_init ("./");
-    CU_ASSERT (alfred_inst != NULL);
+    g_assert (alfred_inst != NULL);
     if (!alfred_inst)
         goto cleanup;
     sleep (1);
 
     /* Trigger provide */
     test_str = apteryx_get ("/test/set_node");
-    CU_ASSERT (test_str && strcmp (test_str, "hello /test/set_node") == 0);
+    g_assert (test_str && strcmp (test_str, "hello /test/set_node") == 0);
 
     /* Clean up */
 cleanup:
@@ -1109,7 +1092,7 @@ test_simple_index ()
 
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
-    CU_ASSERT (library != NULL);
+    g_assert (library != NULL);
     if (!library)
     {
         goto cleanup;
@@ -1124,7 +1107,7 @@ test_simple_index ()
     library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
-    CU_ASSERT (data != NULL);
+    g_assert (data != NULL);
     if (!data)
     {
         goto cleanup;
@@ -1152,7 +1135,7 @@ test_simple_index ()
 
     /* Init */
     alfred_init ("./");
-    CU_ASSERT (alfred_inst != NULL);
+    g_assert (alfred_inst != NULL);
     if (!alfred_inst)
     {
         goto cleanup;
@@ -1161,13 +1144,13 @@ test_simple_index ()
     /* Trigger Action */
     paths = apteryx_search ("/test/");
 
-    CU_ASSERT (g_list_length (paths) == 2);
-    CU_ASSERT (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+    g_assert (g_list_length (paths) == 2);
+    g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
                strcmp ((char *) paths->data, "and the red balloon") == 0));
-    CU_ASSERT (paths && paths->next &&
+    g_assert (paths && paths->next &&
                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
-    CU_ASSERT (paths && paths->next &&
+    g_assert (paths && paths->next &&
                (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
 
     /* Clean up */
@@ -1202,7 +1185,7 @@ test_table_index ()
 
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
-    CU_ASSERT (library != NULL);
+    g_assert (library != NULL);
     if (!library)
     {
         goto cleanup;
@@ -1217,7 +1200,7 @@ test_table_index ()
     library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
-    CU_ASSERT (data != NULL);
+    g_assert (data != NULL);
     if (!data)
     {
         goto cleanup;
@@ -1245,7 +1228,7 @@ test_table_index ()
 
     /* Init */
     alfred_init ("./");
-    CU_ASSERT (alfred_inst != NULL);
+    g_assert (alfred_inst != NULL);
     if (!alfred_inst)
     {
         goto cleanup;
@@ -1254,13 +1237,13 @@ test_table_index ()
     /* Trigger Action */
     paths = apteryx_search ("/test/");
 
-    CU_ASSERT (g_list_length (paths) == 2);
-    CU_ASSERT (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+    g_assert (g_list_length (paths) == 2);
+    g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
                strcmp ((char *) paths->data, "and the red balloon") == 0));
-    CU_ASSERT (paths && paths->next &&
+    g_assert (paths && paths->next &&
                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
-    CU_ASSERT (paths && paths->next &&
+    g_assert (paths && paths->next &&
                (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     /* Clean up */
   cleanup:
@@ -1487,78 +1470,6 @@ test_after_quiet ()
     }
 }
 
-
-static CU_TestInfo tests_alfred[] = {
-    { "simple watch", test_simple_watch },
-    { "directory watch", test_dir_watch },
-    { "simple provide", test_simple_provide },
-    { "simple index", test_simple_index },
-    { "table index", test_table_index },
-    CU_TEST_INFO_NULL,
-};
-
-static CU_SuiteInfo suites[] = {
-    { "Alfred", suite_init, suite_clean, NULL, NULL, tests_alfred },
-    CU_SUITE_INFO_NULL,
-};
-
-void
-run_unit_test (char *filter)
-{
-    /* Initialize the CUnit test registry */
-    if (CUE_SUCCESS != CU_initialize_registry ())
-    {
-        printf ("failed to init\n");
-        return;
-    }
-    assert (NULL != CU_get_registry ());
-    assert (!CU_is_test_running ());
-
-    /* Make some random numbers */
-    srand (time (NULL));
-
-    /* Add tests */
-    CU_SuiteInfo *suite = &suites[0];
-    while (suite && suite->pName)
-    {
-        /* Default to running all tests of a suite */
-        bool all = true;
-        if (filter && strstr (suite->pName, filter) != NULL)
-            all = true;
-        else if (filter)
-            all = false;
-        CU_pSuite pSuite = CU_add_suite (suite->pName, suite->pInitFunc, suite->pCleanupFunc);
-        if (pSuite == NULL)
-        {
-            fprintf (stderr, "suite registration failed - %s\n", CU_get_error_msg ());
-            exit (EXIT_FAILURE);
-        }
-        CU_TestInfo *test = &suite->pTests[0];
-        while (test && test->pName)
-        {
-            if (all || (filter && strstr (test->pName, filter) != NULL))
-            {
-                if (CU_add_test (pSuite, test->pName, test->pTestFunc) == NULL)
-                {
-                    fprintf (stderr, "test registration failed - %s\n",
-                             CU_get_error_msg ());
-                    exit (EXIT_FAILURE);
-                }
-            }
-            test++;
-        }
-        suite++;
-    }
-
-    /* Run all tests using the CUnit Basic interface */
-    CU_basic_set_mode (CU_BRM_VERBOSE);
-    CU_set_error_action (CUEA_IGNORE);
-    CU_basic_run_tests ();
-    CU_cleanup_registry ();
-    return;
-}
-#endif
-
 static gboolean
 termination_handler (gpointer arg1)
 {
@@ -1570,20 +1481,13 @@ termination_handler (gpointer arg1)
 void
 help (char *app_name)
 {
-#ifdef TEST
     printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-c <configdir>] [-u <filter>]\n"
-#else
-    printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-c <configdir>]\n"
-#endif
             "  -h   show this help\n"
             "  -b   background mode\n"
             "  -d   enable verbose debug\n"
             "  -m   memory profiling\n"
             "  -p   use <pidfile> (defaults to "APTERYX_ALFRED_PID")\n"
             "  -c   use <configdir> (defaults to "APTERYX_CONFIG_DIR")\n"
-#ifdef TEST
-            "  -u   Run unit tests\n"
-#endif
             ,app_name);
 }
 
@@ -1597,9 +1501,6 @@ main (int argc, char *argv[])
     FILE *fp = NULL;
     GMainLoop *loop = NULL;
     bool unit_test = false;
-#ifdef TEST
-    char *filter = NULL;
-#endif
 
     /* Parse options */
     while ((i = getopt (argc, argv, "hdbp:c:mu::")) != -1)
@@ -1619,16 +1520,9 @@ main (int argc, char *argv[])
         case 'c':
             config_dir = optarg;
             break;
-#ifdef TEST
         case 'u':
             unit_test = true;
-            if (optarg && optarg[0] == '=')
-            {
-                memmove (optarg, optarg + 1, strlen (optarg));
-            }
-            filter = optarg;
             break;
-#endif
         case '?':
         case 'h':
         default:
@@ -1649,11 +1543,8 @@ main (int argc, char *argv[])
 
     cb_init ();
 
-#ifdef TEST
     if (unit_test)
     {
-        run_unit_test (filter);
-
         pthread_t main_thread;
         pthread_attr_t attr;
 
@@ -1661,6 +1552,11 @@ main (int argc, char *argv[])
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
         g_test_init (&argc, &argv, NULL);
+        g_test_add_func ("/test_simple_watch", test_simple_watch);
+        g_test_add_func ("/test_dir_watch", test_dir_watch);
+        g_test_add_func ("/test_simple_provide", test_simple_provide);
+        g_test_add_func ("/test_simple_index", test_simple_index);
+        g_test_add_func ("/test_table_index", test_table_index);
         g_test_add_func ("/test_rate_limit", test_rate_limit);
         g_test_add_func ("/test_after_quiet", test_after_quiet);
 
@@ -1675,7 +1571,6 @@ main (int argc, char *argv[])
         goto exit;
     }
     else
-#endif
     {
         /* Create the alfred glists */
         alfred_init (config_dir);
