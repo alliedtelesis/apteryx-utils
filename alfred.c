@@ -800,27 +800,21 @@ test_simple_watch ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
+        fprintf (library,
+                "function test_library_function(test_str)\n"
+                "  test_value = test_str\n"
+                "end\n"
+                );
+        fclose (library);
     }
-
-    fprintf (library,
-            "function test_library_function(test_str)\n"
-            "  test_value = test_str\n"
-            "end\n"
-            );
-    fclose (library);
-    library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
+    if (data)
     {
-        goto cleanup;
-    }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
@@ -836,51 +830,89 @@ test_simple_watch ()
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
-    fclose (data);
-    data = NULL;
+        fclose (data);
+    }
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
+    if (alfred_inst)
     {
-        goto cleanup;
+        /* Trigger Action */
+        apteryx_set ("/test/set_node", "Goodnight moon");
+        sleep (1);
+
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+        {
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        }
+        lua_pop (alfred_inst->ls, 1);
+
+        g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
+        apteryx_set ("/test/set_node", NULL);
     }
 
-    /* Trigger Action */
-    apteryx_set ("/test/set_node", "Goodnight moon");
-    sleep (1);
-
-    /* Check output */
-    lua_getglobal (alfred_inst->ls, "test_value");
-    if (!lua_isnil (alfred_inst->ls, -1))
-    {
-        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-    }
-    lua_pop (alfred_inst->ls, 1);
-
-    g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
-    apteryx_set ("/test/set_node", NULL);
     /* Clean up */
-  cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
     }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
+}
+
+void
+test_native_watch ()
+{
+    FILE *library = NULL;
+    char *test_str = NULL;
+
+    /* Create library file only */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
     if (library)
     {
+        fprintf (library,
+                "apteryx = require('apteryx')\n"
+                "function test_node_change(path,value)\n"
+                "  test_value = value\n"
+                "  apteryx.unwatch('/test/set_node', test_node_change)\n"
+                "end\n"
+                "apteryx.watch('/test/set_node', test_node_change)\n"
+                );
         fclose (library);
-        unlink ("alfred_test.lua");
     }
-    if (data)
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
     {
-        fclose (data);
-        unlink ("alfred_test.xml");
+        /* Trigger Action */
+        apteryx_set ("/test/set_node", "Goodnight moon");
+        sleep (1);
+
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+        {
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        }
+        lua_pop (alfred_inst->ls, 1);
+        g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
+        apteryx_set ("/test/set_node", NULL);
     }
-    if (test_str)
+
+    /* Clean up */
+    if (alfred_inst)
     {
-        free (test_str);
+        alfred_shutdown ();
     }
+    unlink ("alfred_test.lua");
+    free (test_str);
 }
 
 void
@@ -894,28 +926,22 @@ test_dir_watch ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
+        fprintf (library,
+                "function test_library_function(p, v)\n"
+                "  test_value = v\n"
+                "  test_path = p\n"
+                "end\n"
+                );
+        fclose (library);
     }
-
-    fprintf (library,
-            "function test_library_function(p, v)\n"
-            "  test_value = v\n"
-            "  test_path = p\n"
-            "end\n"
-            );
-    fclose (library);
-    library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
+    if (data)
     {
-        goto cleanup;
-    }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
@@ -933,81 +959,65 @@ test_dir_watch ()
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
-    fclose (data);
-    data = NULL;
+        fclose (data);
+    }
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
-        goto cleanup;
+    if (alfred_inst)
+    {
+        /* Trigger Action */
+        apteryx_set ("/test/set_node", "Goodnight cow jumping over the moon");
+        sleep (1);
 
-    /* Trigger Action */
-    apteryx_set ("/test/set_node", "Goodnight cow jumping over the moon");
-    sleep (1);
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (alfred_inst->ls, "test_path");
+        if (!lua_isnil (alfred_inst->ls, -1))
+            test_path = strdup (lua_tostring (alfred_inst->ls, -1));
+        lua_pop (alfred_inst->ls, 1);
 
-    /* Check output */
-    lua_getglobal (alfred_inst->ls, "test_value");
-    if (!lua_isnil (alfred_inst->ls, -1))
-        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-    lua_pop (alfred_inst->ls, 1);
-    lua_getglobal (alfred_inst->ls, "test_path");
-    if (!lua_isnil (alfred_inst->ls, -1))
-        test_path = strdup (lua_tostring (alfred_inst->ls, -1));
-    lua_pop (alfred_inst->ls, 1);
+        g_assert (test_path && strcmp (test_path, "/test/set_node") == 0);
+        g_assert (test_str && strcmp (test_str, "Goodnight cow jumping over the moon") == 0);
+        free (test_path);
+        free (test_str);
 
-    g_assert (test_path && strcmp (test_path, "/test/set_node") == 0);
-    g_assert (test_str && strcmp (test_str, "Goodnight cow jumping over the moon") == 0);
-    free (test_path);
-    free (test_str);
+        /* Trigger Action */
+        apteryx_set ("/test/deeper/set_node", "Goodnight bears");
+        sleep (1);
 
-    /* Trigger Action */
-    apteryx_set ("/test/deeper/set_node", "Goodnight bears");
-    sleep (1);
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        lua_pop (alfred_inst->ls, 1);
 
-    /* Check output */
-    lua_getglobal (alfred_inst->ls, "test_value");
-    if (!lua_isnil (alfred_inst->ls, -1))
-        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-    lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (alfred_inst->ls, "test_path");
+        if (!lua_isnil (alfred_inst->ls, -1))
+            test_path = strdup (lua_tostring (alfred_inst->ls, -1));
+        lua_pop (alfred_inst->ls, 1);
 
-    lua_getglobal (alfred_inst->ls, "test_path");
-    if (!lua_isnil (alfred_inst->ls, -1))
-        test_path = strdup (lua_tostring (alfred_inst->ls, -1));
-    lua_pop (alfred_inst->ls, 1);
+        g_assert (test_path && strcmp (test_path, "/test/deeper/set_node") == 0);
+        g_assert (test_str && strcmp (test_str, "Goodnight bears") == 0);
 
-    g_assert (test_path && strcmp (test_path, "/test/deeper/set_node") == 0);
-    g_assert (test_str && strcmp (test_str, "Goodnight bears") == 0);
+        apteryx_set ("/test/set_node", NULL);
+        apteryx_set ("/test/deeper/set_node", NULL);
+    }
 
-    apteryx_set ("/test/set_node", NULL);
-    apteryx_set ("/test/deeper/set_node", NULL);
-
-  /* Clean up */
-  cleanup:
+    /* Clean up */
     if (alfred_inst)
     {
         alfred_shutdown ();
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
-    if (test_str)
-    {
-        free (test_str);
-    }
-    if (test_path)
-    {
-        free (test_path);
-    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
+    free (test_path);
 }
-
 
 void
 test_simple_provide ()
@@ -1019,23 +1029,21 @@ test_simple_provide ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
-        goto cleanup;
-
-    fprintf (library,
-            "function test_library_function(path)\n"
-            "  return \"hello \"..path\n"
-            "end\n"
-            );
-    fclose (library);
-    library = NULL;
+    if (library)
+    {
+        fprintf (library,
+                "function test_library_function(path)\n"
+                "  return \"hello \"..path\n"
+                "end\n"
+                );
+        fclose (library);
+    }
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
-        goto cleanup;
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    if (data)
+    {
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
@@ -1051,42 +1059,71 @@ test_simple_provide ()
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
-    fclose (data);
-    data = NULL;
+        fclose (data);
+    }
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
-        goto cleanup;
-    sleep (1);
+    if (alfred_inst)
+    {
+        sleep (1);
 
-    /* Trigger provide */
-    test_str = apteryx_get ("/test/set_node");
-    g_assert (test_str && strcmp (test_str, "hello /test/set_node") == 0);
+        /* Trigger provide */
+        test_str = apteryx_get ("/test/set_node");
+        g_assert (test_str && strcmp (test_str, "hello /test/set_node") == 0);
+    }
 
     /* Clean up */
-cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
-    if (test_str)
-    {
-        free (test_str);
-    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
 }
 
+void
+test_native_provide ()
+{
+    FILE *library = NULL;
+    char *test_str = NULL;
+
+    /* Create library file only */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (library)
+    {
+        fprintf (library,
+                "apteryx = require('apteryx')\n"
+                "function test_node_provide(path)\n"
+                "  apteryx.unprovide('/test/set_node', test_node_provide)\n"
+                "  return \"hello \"..path\n"
+                "end\n"
+                "apteryx.provide('/test/set_node', test_node_provide)\n"
+                );
+        fclose (library);
+    }
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
+    {
+        /* Trigger provide */
+        test_str = apteryx_get ("/test/set_node");
+        g_assert (test_str && strcmp (test_str, "hello /test/set_node") == 0);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.lua");
+    free (test_str);
+}
 
 void
 test_simple_index ()
@@ -1098,27 +1135,21 @@ test_simple_index ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
-    }
-
-    fprintf (library,
+        fprintf (library,
             "function test_library_function()\n"
             "  return {\"Goodnight light\", \"and the red balloon\"}\n"
             "end\n"
             );
-    fclose (library);
-    library = NULL;
+        fclose (library);
+    }
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
+    if (data)
     {
-        goto cleanup;
-    }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
@@ -1135,46 +1166,35 @@ test_simple_index ()
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
-    fclose (data);
-    data = NULL;
+        fclose (data);
+    }
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
+    if (alfred_inst)
     {
-        goto cleanup;
+        /* Trigger Action */
+        paths = apteryx_search ("/test/");
+
+        g_assert (g_list_length (paths) == 2);
+        g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+                strcmp ((char *) paths->data, "and the red balloon") == 0));
+        g_assert (paths && paths->next &&
+                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
+                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+        g_assert (paths && paths->next &&
+                (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     }
 
-    /* Trigger Action */
-    paths = apteryx_search ("/test/");
-
-    g_assert (g_list_length (paths) == 2);
-    g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
-               strcmp ((char *) paths->data, "and the red balloon") == 0));
-    g_assert (paths && paths->next &&
-               (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
-               strcmp ((char *) paths->next->data, "Goodnight light") == 0));
-    g_assert (paths && paths->next &&
-               (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
-
     /* Clean up */
-  cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
         alfred_inst = NULL;
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
     if (paths)
     {
         g_list_free_full (paths, free);
@@ -1182,91 +1202,52 @@ test_simple_index ()
 }
 
 void
-test_table_index ()
+test_native_index ()
 {
     FILE *library = NULL;
-    FILE *data = NULL;
     GList *paths = NULL;
 
-    /* Create library file + XML */
+    /* Create library file only */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
+        fprintf (library,
+                "apteryx = require('apteryx')\n"
+                "function test_node_index(path)\n"
+                "  apteryx.unindex('/test', test_node_index)\n"
+                "  return {\"Goodnight light\", \"and the red balloon\"}\n"
+                "end\n"
+                "apteryx.index('/test', test_node_index)\n"
+                );
+        fclose (library);
     }
-
-    fprintf (library,
-            "function test_library_function()\n"
-            "  return {\"Goodnight light\", \"and the red balloon\"}\n"
-            "end\n"
-            );
-    fclose (library);
-    library = NULL;
-
-    data = fopen ("alfred_test.xml", "w");
-    g_assert (data != NULL);
-    if (!data)
-    {
-        goto cleanup;
-    }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
-                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
-                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
-                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
-                   "  <SCRIPT>\n"
-                   "  function test_index(path)\n"
-                   "    return test_library_function()\n"
-                   "  end\n"
-                   "  </SCRIPT>\n"
-                   "  <NODE name=\"test\">\n"
-                   "    <NODE name=\"*\" help=\"Set this node to test the watch function\">\n"
-                   "      <INDEX>return test_index(_path)</INDEX>\n"
-                   "      <NODE name=\"id\" mode=\"rw\"/>\n"
-                   "    </NODE>\n"
-                   "  </NODE>\n"
-                   "</MODULE>\n");
-    fclose (data);
-    data = NULL;
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
+    if (alfred_inst)
     {
-        goto cleanup;
+        /* Trigger Action */
+        paths = apteryx_search ("/test/");
+
+        g_assert (g_list_length (paths) == 2);
+        g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
+                strcmp ((char *) paths->data, "and the red balloon") == 0));
+        g_assert (paths && paths->next &&
+                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
+                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+        g_assert (paths && paths->next &&
+                (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     }
 
-    /* Trigger Action */
-    paths = apteryx_search ("/test/");
-
-    g_assert (g_list_length (paths) == 2);
-    g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
-               strcmp ((char *) paths->data, "and the red balloon") == 0));
-    g_assert (paths && paths->next &&
-               (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
-               strcmp ((char *) paths->next->data, "Goodnight light") == 0));
-    g_assert (paths && paths->next &&
-               (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     /* Clean up */
-  cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
         alfred_inst = NULL;
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
+    unlink ("alfred_test.lua");
     if (paths)
     {
         g_list_free_full (paths, free);
@@ -1285,27 +1266,21 @@ test_rate_limit ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
-    }
-
-    fprintf (library,
+        fprintf (library,
             "function test_library_function(test_str)\n"
             "  test_value = test_str\n"
             "end\n"
             );
-    fclose (library);
-    library = NULL;
+        fclose (library);
+    }
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
+    if (data)
     {
-        goto cleanup;
-    }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
@@ -1321,57 +1296,45 @@ test_rate_limit ()
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
-    fclose (data);
-    data = NULL;
+        fclose (data);
+    }
+
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
+    if (alfred_inst)
     {
-        goto cleanup;
+        /* Trigger Action */
+        int count = 0;
+
+        while (count < 50)
+        {
+            apteryx_set ("/test/set_node", "Goodnight scoot");
+            count++;
+        }
+
+        sleep (1);
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+        {
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        }
+        lua_pop (alfred_inst->ls, 1);
+
+        g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+        apteryx_set ("/test/set_node", NULL);
+        sleep(1);
     }
 
-    /* Trigger Action */
-    int count = 0;
-
-    while (count < 50)
-    {
-        apteryx_set ("/test/set_node", "Goodnight scoot");
-        count++;
-    }
-
-    sleep (1);
-    /* Check output */
-    lua_getglobal (alfred_inst->ls, "test_value");
-    if (!lua_isnil (alfred_inst->ls, -1))
-    {
-        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-    }
-    lua_pop (alfred_inst->ls, 1);
-
-    g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
-    apteryx_set ("/test/set_node", NULL);
-    sleep(1);
     /* Clean up */
-  cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
-    if (test_str)
-    {
-        free (test_str);
-    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
 }
 
 /* Glib unit test */
@@ -1386,93 +1349,75 @@ test_after_quiet ()
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
-    if (!library)
+    if (library)
     {
-        goto cleanup;
+        fprintf (library,
+                "function test_library_function(test_str)\n"
+                "  test_value = test_str\n"
+                "end\n"
+                );
+        fclose (library);
     }
-    fprintf (library,
-            "function test_library_function(test_str)\n"
-            "  test_value = test_str\n"
-            "end\n"
-            );
-    fclose (library);
-    library = NULL;
 
     data = fopen ("alfred_test.xml", "w");
     g_assert (data != NULL);
-    if (!data)
+    if (data)
     {
-        goto cleanup;
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                    "  <SCRIPT>\n"
+                    "  function test_node_change(new_value)\n"
+                    "    test_library_function(new_value)\n"
+                    "  end\n"
+                    "  </SCRIPT>\n"
+                    "  <NODE name=\"test\">\n"
+                    "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                    "      <WATCH>Alfred.after_quiet(0.1,'test_node_change(_value)')</WATCH>\n"
+                    "    </NODE>\n"
+                    "  </NODE>\n"
+                    "</MODULE>\n");
+        fclose (data);
     }
-
-    fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
-                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
-                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
-                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
-                   "  <SCRIPT>\n"
-                   "  function test_node_change(new_value)\n"
-                   "    test_library_function(new_value)\n"
-                   "  end\n"
-                   "  </SCRIPT>\n"
-                   "  <NODE name=\"test\">\n"
-                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
-                   "      <WATCH>Alfred.after_quiet(0.1,'test_node_change(_value)')</WATCH>\n"
-                   "    </NODE>\n"
-                   "  </NODE>\n"
-                   "</MODULE>\n");
-    fclose (data);
-    data = NULL;
 
     /* Init */
     alfred_init ("./");
     g_assert (alfred_inst != NULL);
-    if (!alfred_inst)
+    if (alfred_inst)
     {
-        goto cleanup;
+        /* Trigger Action */
+        int count = 0;
+
+        while (count < 50)
+        {
+            apteryx_set ("/test/set_node", "Goodnight scoot");
+            count++;
+        }
+
+        sleep (1);
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+        {
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        }
+        lua_pop (alfred_inst->ls, 1);
+
+        g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+        apteryx_set ("/test/set_node", NULL);
+        sleep(1);
     }
 
-    /* Trigger Action */
-    int count = 0;
-
-    while (count < 50)
-    {
-        apteryx_set ("/test/set_node", "Goodnight scoot");
-        count++;
-    }
-
-    sleep (1);
-    /* Check output */
-    lua_getglobal (alfred_inst->ls, "test_value");
-    if (!lua_isnil (alfred_inst->ls, -1))
-    {
-        test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-    }
-    lua_pop (alfred_inst->ls, 1);
-
-    g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
-    apteryx_set ("/test/set_node", NULL);
-    sleep(1);
     /* Clean up */
-  cleanup:
     if (alfred_inst)
     {
         alfred_shutdown ();
     }
-    if (library)
-    {
-        fclose (library);
-        unlink ("alfred_test.lua");
-    }
-    if (data)
-    {
-        fclose (data);
-        unlink ("alfred_test.xml");
-    }
-    if (test_str)
-    {
-        free (test_str);
-    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
 }
 
 static gboolean
@@ -1575,10 +1520,12 @@ main (int argc, char *argv[])
 
         g_test_init (&argc, &argv, NULL);
         g_test_add_func ("/test_simple_watch", test_simple_watch);
+        g_test_add_func ("/test_native_watch", test_native_watch);
         g_test_add_func ("/test_dir_watch", test_dir_watch);
         g_test_add_func ("/test_simple_provide", test_simple_provide);
+        g_test_add_func ("/test_native_provide", test_native_provide);
         g_test_add_func ("/test_simple_index", test_simple_index);
-        g_test_add_func ("/test_table_index", test_table_index);
+        g_test_add_func ("/test_native_index", test_native_index);
         g_test_add_func ("/test_rate_limit", test_rate_limit);
         g_test_add_func ("/test_after_quiet", test_after_quiet);
 
