@@ -47,9 +47,11 @@ struct alfred_instance_t
     lua_State *ls;
     /* List of watches based on path */
     GList *watches;
+    /* List of refreshers based on path */
+    GList *refreshers;
     /* List of provides based on path */
     GList *provides;
-    /* List of provides based on path */
+    /* List of indexes based on path */
     GList *indexes;
 } alfred_instance_t;
 typedef struct alfred_instance_t *alfred_instance;
@@ -144,6 +146,46 @@ watch_node_changed (const char *path, const char *value)
             lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
     DEBUG ("ALFRED WATCH: %s = %s\n", path, value);
     return ret;
+}
+
+uint64_t
+refresh_node_changed (const char *path)
+{
+    uint64_t timeout;
+    GList *matches = NULL;
+    char *script = NULL;
+    cb_info_t *cb = NULL;
+    int s_0;
+
+    matches = cb_match (&alfred_inst->refreshers, path, CB_MATCH_EXACT | CB_MATCH_WILD_PATH);
+    if (matches == NULL)
+    {
+        ERROR ("ALFRED: No Alfred refresh for %s\n", path);
+        return 0;
+    }
+
+    cb = g_list_first (matches)->data;
+    script = (char *) (long) cb->cb;
+    lua_pushstring (alfred_inst->ls, path);
+    lua_setglobal (alfred_inst->ls, "_path");
+    s_0 = lua_gettop (alfred_inst->ls);
+    if (!alfred_exec (alfred_inst->ls, script, 1))
+    {
+        ERROR ("Lua: Failed to execute refresh script for path: %s\n", path);
+    }
+    g_list_free_full (matches, (GDestroyNotify) cb_release);
+    /* The return value of luaL_dostring is the top value of the stack */
+    timeout = lua_tonumber (alfred_inst->ls, -1);
+    lua_pop (alfred_inst->ls, 1);
+
+    DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (alfred_inst->ls),
+            lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
+    if (lua_gettop (alfred_inst->ls) != s_0)
+    {
+        ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
+                lua_gettop (alfred_inst->ls), path);
+    }
+    return timeout;
 }
 
 char *
@@ -255,6 +297,19 @@ alfred_register_watches (gpointer value, gpointer user_data)
 }
 
 static void
+alfred_register_refresh (gpointer value, gpointer user_data)
+{
+    cb_info_t *cb = (cb_info_t *) value;
+    int install = GPOINTER_TO_INT (user_data);
+
+    if ((install && !apteryx_refresh (cb->path, refresh_node_changed)) ||
+        (!install && !apteryx_unrefresh (cb->path, refresh_node_changed)))
+    {
+        ERROR ("Failed to (un)register refresh for path %s\n", cb->path);
+    }
+}
+
+static void
 alfred_register_provide (gpointer value, gpointer user_data)
 {
     cb_info_t *cb = (cb_info_t *) value;
@@ -288,6 +343,19 @@ destroy_watches (gpointer value, gpointer rpc)
     DEBUG ("XML: Destroy watches for path %s\n", cb->path);
 
     g_list_free_full (scripts, g_free);
+    cb_destroy (cb);
+    cb_release (cb);
+    return true;
+}
+
+static bool
+destroy_refresher (gpointer value, gpointer rpc)
+{
+    cb_info_t *cb = (cb_info_t *) value;
+    char *script = (char *) (long) cb->cb;
+    DEBUG ("XML: Destroy refresher for path %s\n", cb->path);
+
+    g_free (script);
     cb_destroy (cb);
     cb_release (cb);
     return true;
@@ -404,6 +472,27 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         {
             res = false;
             goto exit;
+        }
+    }
+    else if (strcmp ((const char *) node->name, "REFRESH") == 0)
+    {
+        content = xmlNodeGetContent (node);
+        tmp_content = g_strdup ((char *) content);
+        DEBUG ("REFRESH: %s, XML STR: %s\n", parent, content);
+
+        /* If the node is a leaf or ends in a '*' don't add another '*' */
+        if (node_is_leaf (node->parent) || parent[strlen (parent) - 1] == '*')
+        {
+            path = g_strdup (parent);
+        }
+        else
+        {
+            path = g_strdup_printf ("%s/*", parent);
+        }
+        if (path)
+        {
+            cb = cb_create (&alfred->refreshers, "", (const char *) path, 0,
+                            (uint64_t) (long) tmp_content);
         }
     }
     else if (strcmp ((const char *) node->name, "PROVIDE") == 0)
@@ -681,6 +770,15 @@ alfred_shutdown (void)
         g_list_foreach (alfred_inst->watches, (GFunc) destroy_watches, NULL);
         g_list_free (alfred_inst->watches);
     }
+
+    if (alfred_inst->refreshers)
+    {
+        g_list_foreach (alfred_inst->refreshers, (GFunc) alfred_register_refresh,
+                        GINT_TO_POINTER (0));
+        g_list_foreach (alfred_inst->refreshers, (GFunc) destroy_refresher, NULL);
+        g_list_free (alfred_inst->refreshers);
+    }
+
     if (alfred_inst->provides)
     {
         g_list_foreach (alfred_inst->provides, (GFunc) alfred_register_provide,
@@ -751,6 +849,9 @@ alfred_init (const char *path)
 
     /* Register watches */
     g_list_foreach (alfred_inst->watches, (GFunc) alfred_register_watches, GINT_TO_POINTER (1));
+
+    /* Register refreshers */
+    g_list_foreach (alfred_inst->refreshers, (GFunc) alfred_register_refresh, GINT_TO_POINTER (1));
 
     /* Register provides */
     g_list_foreach (alfred_inst->provides, (GFunc) alfred_register_provide, GINT_TO_POINTER (1));
@@ -1100,6 +1201,124 @@ test_native_provide ()
     }
     unlink ("alfred_test.lua");
     free (test_str);
+}
+
+void
+test_simple_refresh ()
+{
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    /* Create XML */
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (data)
+    {
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                   "  <SCRIPT>\n"
+                   "  count = 0\n"
+                   "  function test_refresh(path)\n"
+                   "    assert (path == '/test/refresh')\n"
+                   "    apteryx.set('/test/refresh', tostring(count))\n"
+                   "    count = count + 1\n"
+                   "    return 500000\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"refresh\" mode=\"rw\"  help=\"Get this node to test the refresh function\">\n"
+                   "      <REFRESH>return test_refresh(_path)</REFRESH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+        fclose (data);
+    }
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
+    {
+        sleep (1);
+
+        /* Trigger provide */
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "0") == 0);
+        free (test_str);
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "0") == 0);
+        free (test_str);
+        usleep (500000);
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        apteryx_set ("/test/refresh", NULL);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.xml");
+}
+
+void
+test_native_refresh ()
+{
+    FILE *library = NULL;
+    char *test_str = NULL;
+
+    /* Create library file only */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (library)
+    {
+        fprintf (library,
+                "apteryx = require('apteryx')\n"
+                "count = 0\n"
+                "function test_refresh(path)\n"
+                "  assert (path == '/test/refresh')\n"
+                "  if count == 1 then\n"
+                "    apteryx.unrefresh('/test/refresh', test_refresh)\n"
+                "  end\n"
+                "  apteryx.set('/test/refresh', tostring(count))\n"
+                "  count = count + 1\n"
+                "  return 500000\n"
+                "end\n"
+                "apteryx.refresh('/test/refresh', test_refresh)\n"
+                );
+        fclose (library);
+    }
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
+    {
+        /* Trigger provide */
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "0") == 0);
+        free (test_str);
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "0") == 0);
+        free (test_str);
+        usleep (500000);
+        test_str = apteryx_get ("/test/refresh");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        apteryx_set ("/test/refresh", NULL);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.lua");
 }
 
 void
@@ -1499,6 +1718,8 @@ main (int argc, char *argv[])
         g_test_add_func ("/test_simple_watch", test_simple_watch);
         g_test_add_func ("/test_native_watch", test_native_watch);
         g_test_add_func ("/test_dir_watch", test_dir_watch);
+        g_test_add_func ("/test_simple_refresh", test_simple_refresh);
+        g_test_add_func ("/test_native_refresh", test_native_refresh);
         g_test_add_func ("/test_simple_provide", test_simple_provide);
         g_test_add_func ("/test_native_provide", test_native_provide);
         g_test_add_func ("/test_simple_index", test_simple_index);
