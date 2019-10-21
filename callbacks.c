@@ -189,12 +189,15 @@ cb_match (GList **list, const char *path, int criteria)
                             break;
                         }
                     }
-
                     if (*pattern == '\0' && *p && !strcmp (pattern - 1, "*"))
                     {
                         match = true;
                     }
                     else if (*pattern == '\0' && *p == '\0')
+                    {
+                        match = true;
+                    }
+                    else if (*p == '\0' && *pattern == '*' && *(pattern + 1) == '\0' )
                     {
                         match = true;
                     }
