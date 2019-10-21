@@ -1208,6 +1208,7 @@ test_simple_refresh ()
 {
     FILE *data = NULL;
     char *test_str = NULL;
+    GList *paths = NULL;
 
     /* Create XML */
     data = fopen ("alfred_test.xml", "w");
@@ -1222,15 +1223,17 @@ test_simple_refresh ()
                    "  <SCRIPT>\n"
                    "  count = 0\n"
                    "  function test_refresh(path)\n"
-                   "    assert (path == '/test/refresh')\n"
-                   "    apteryx.set('/test/refresh', tostring(count))\n"
+                   "    apteryx.set('/test/eth0/refresh/count', tostring(count))\n"
                    "    count = count + 1\n"
                    "    return 500000\n"
                    "  end\n"
                    "  </SCRIPT>\n"
                    "  <NODE name=\"test\">\n"
-                   "    <NODE name=\"refresh\" mode=\"rw\"  help=\"Get this node to test the refresh function\">\n"
-                   "      <REFRESH>return test_refresh(_path)</REFRESH>\n"
+                   "    <NODE name=\"*\">\n"
+                   "      <NODE name=\"refresh\">\n"
+                   "        <NODE name=\"count\" mode=\"rw\" help=\"Get this node to test the refresh function\" />\n"
+                   "        <REFRESH>return test_refresh(_path)</REFRESH>\n"
+                   "      </NODE>\n"
                    "    </NODE>\n"
                    "  </NODE>\n"
                    "</MODULE>\n");
@@ -1244,18 +1247,25 @@ test_simple_refresh ()
     {
         sleep (1);
 
-        /* Trigger provide */
-        test_str = apteryx_get ("/test/refresh");
-        g_assert (test_str && strcmp (test_str, "0") == 0);
-        free (test_str);
-        test_str = apteryx_get ("/test/refresh");
-        g_assert (test_str && strcmp (test_str, "0") == 0);
-        free (test_str);
+        /* Search */
+        paths = apteryx_search ("/test/eth0/refresh/");
+        g_assert (g_list_length (paths) == 1);
+        g_assert (paths && (strcmp ((char *) paths->data, "/test/eth0/refresh/count") == 0));
+        g_list_free_full (paths, free);
         usleep (500000);
-        test_str = apteryx_get ("/test/refresh");
+
+        /* Trigger provide */
+        test_str = apteryx_get ("/test/eth0/refresh/count");
         g_assert (test_str && strcmp (test_str, "1") == 0);
         free (test_str);
-        apteryx_set ("/test/refresh", NULL);
+        test_str = apteryx_get ("/test/eth0/refresh/count");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        usleep (500000);
+        test_str = apteryx_get ("/test/eth0/refresh/count");
+        g_assert (test_str && strcmp (test_str, "2") == 0);
+        free (test_str);
+        apteryx_set ("/test/eth0/refresh/count", NULL);
     }
 
     /* Clean up */
@@ -1271,6 +1281,7 @@ test_native_refresh ()
 {
     FILE *library = NULL;
     char *test_str = NULL;
+    GList *paths = NULL;
 
     /* Create library file only */
     library = fopen ("alfred_test.lua", "w");
@@ -1281,15 +1292,14 @@ test_native_refresh ()
                 "apteryx = require('apteryx')\n"
                 "count = 0\n"
                 "function test_refresh(path)\n"
-                "  assert (path == '/test/refresh')\n"
-                "  if count == 1 then\n"
-                "    apteryx.unrefresh('/test/refresh', test_refresh)\n"
+                "  if count == 2 then\n"
+                "    apteryx.unrefresh('/test/refresh/*', test_refresh)\n"
                 "  end\n"
-                "  apteryx.set('/test/refresh', tostring(count))\n"
+                "  apteryx.set('/test/refresh/count', tostring(count))\n"
                 "  count = count + 1\n"
                 "  return 500000\n"
                 "end\n"
-                "apteryx.refresh('/test/refresh', test_refresh)\n"
+                "apteryx.refresh('/test/refresh/*', test_refresh)\n"
                 );
         fclose (library);
     }
@@ -1299,18 +1309,25 @@ test_native_refresh ()
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
-        /* Trigger provide */
-        test_str = apteryx_get ("/test/refresh");
-        g_assert (test_str && strcmp (test_str, "0") == 0);
-        free (test_str);
-        test_str = apteryx_get ("/test/refresh");
-        g_assert (test_str && strcmp (test_str, "0") == 0);
-        free (test_str);
+        /* Search */
+        paths = apteryx_search ("/test/refresh/");
+        g_assert (g_list_length (paths) == 1);
+        g_assert (paths && (strcmp ((char *) paths->data, "/test/refresh/count") == 0));
+        g_list_free_full (paths, free);
         usleep (500000);
-        test_str = apteryx_get ("/test/refresh");
+
+        /* Get */
+        test_str = apteryx_get ("/test/refresh/count");
         g_assert (test_str && strcmp (test_str, "1") == 0);
         free (test_str);
-        apteryx_set ("/test/refresh", NULL);
+        test_str = apteryx_get ("/test/refresh/count");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        usleep (500000);
+        test_str = apteryx_get ("/test/refresh/count");
+        g_assert (test_str && strcmp (test_str, "2") == 0);
+        free (test_str);
+        apteryx_set ("/test/refresh/count", NULL);
     }
 
     /* Clean up */
