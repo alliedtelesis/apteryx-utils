@@ -5,7 +5,7 @@
 # sudo apt-get install libglib2.0-dev liblua5.2-dev libxml2-dev libcunit1-dev
 #
 # TEST_WRAPPER="G_SLICE=always-malloc valgrind --leak-check=full" make test
-# TEST_WRAPPER="gdb" make test
+# TEST_WRAPPER="gdb --args" make test
 #
 
 ifneq ($(V),1)
@@ -35,7 +35,10 @@ ifdef APTERYX_XML_PATH
 EXTRA_CFLAGS += -I$(APTERYX_XML_PATH)
 EXTRA_LDFLAGS += -L$(APTERYX_XML_PATH)
 endif
-LUAVERSION := $(shell $(PKG_CONFIG) --exists lua && echo lua || ($(PKG_CONFIG) --exists lua5.2 && echo lua5.2 || echo none))
+LUAVERSION := $(shell ($(PKG_CONFIG) --exists lua5.3 && echo lua5.3 ||\
+	($(PKG_CONFIG) --exists lua5.2 && echo lua5.2 ||\
+	($(PKG_CONFIG) --exists lua && echo lua ||\
+	echo none))))
 EXTRA_CFLAGS += -DHAVE_LUA $(shell $(PKG_CONFIG) --cflags $(LUAVERSION))
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs $(LUAVERSION)) -ldl
 EXTRA_CFLAGS += -DHAVE_LIBXML2 $(shell $(PKG_CONFIG) --cflags libxml-2.0)
