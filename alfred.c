@@ -60,6 +60,8 @@ typedef struct alfred_instance_t *alfred_instance;
 alfred_instance alfred_inst = NULL;
 static int alfred_apteryx_fd = -1;
 
+int luaopen_apteryx (lua_State *L);
+
 static void
 alfred_error (lua_State *ls, int res)
 {
@@ -823,11 +825,18 @@ alfred_init (const char *path)
         CRITICAL ("XML: Failed to instantiate Lua interpreter\n");
         goto error;
     }
+
+    /* Load required libraries */
     luaL_openlibs (alfred_inst->ls);
-    if (luaL_dostring (alfred_inst->ls, "apteryx = require('apteryx')") != 0)
+    if (luaopen_apteryx (alfred_inst->ls))
     {
-        ERROR ("Lua: Failed to require('apteryx')\n");
+        /* Provide global access to the Apteryx library */
+        lua_setglobal (alfred_inst->ls, "apteryx");
     }
+
+    /* Load the apteryx-xml API if available
+       api = require("apteryx.xml").api("/etc/apteryx/schema/")
+     */
     if (luaL_dostring (alfred_inst->ls, "require('api')") != 0)
     {
         ERROR ("Lua: Failed to require('api')\n");
@@ -954,7 +963,6 @@ test_native_watch ()
     if (library)
     {
         fprintf (library,
-                "apteryx = require('apteryx')\n"
                 "function test_node_change(path,value)\n"
                 "  test_value = value\n"
                 "  apteryx.unwatch('/test/set_node', test_node_change)\n"
@@ -1174,7 +1182,6 @@ test_native_provide ()
     if (library)
     {
         fprintf (library,
-                "apteryx = require('apteryx')\n"
                 "function test_node_provide(path)\n"
                 "  apteryx.unprovide('/test/set_node', test_node_provide)\n"
                 "  return \"hello \"..path\n"
@@ -1289,7 +1296,6 @@ test_native_refresh ()
     if (library)
     {
         fprintf (library,
-                "apteryx = require('apteryx')\n"
                 "count = 0\n"
                 "function test_refresh(path)\n"
                 "  if count == 2 then\n"
@@ -1426,7 +1432,6 @@ test_native_index ()
     if (library)
     {
         fprintf (library,
-                "apteryx = require('apteryx')\n"
                 "function test_node_index(path)\n"
                 "  apteryx.unindex('/test', test_node_index)\n"
                 "  return {\"Goodnight light\", \"and the red balloon\"}\n"
@@ -1638,7 +1643,9 @@ process_apteryx (GIOChannel *source, GIOCondition condition, gpointer data)
 {
     assert (alfred_inst);
     luaL_loadstring (alfred_inst->ls, "apteryx.process()");
-    lua_pcall (alfred_inst->ls, 0, 0, 0);
+    int res = lua_pcall (alfred_inst->ls, 0, 0, 0);
+    if (res != 0)
+        alfred_error (alfred_inst->ls, res);
     uint8_t dummy = 0;
     if (read (alfred_apteryx_fd, &dummy, 1) == 0)
     {
