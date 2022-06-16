@@ -1854,6 +1854,7 @@ test_rate_limit ()
     FILE *library = NULL;
     FILE *data = NULL;
     char *test_str = NULL;
+    lua_Integer test_count;
 
     apteryx_init (false);
     /* Create library file + XML */
@@ -1862,8 +1863,10 @@ test_rate_limit ()
     if (library)
     {
         fprintf (library,
+            "count = 0\n\n"
             "function test_library_function(test_str)\n"
             "  test_value = test_str\n"
+            "  count = count + 1\n"
             "end\n"
             );
         fclose (library);
@@ -1915,7 +1918,12 @@ test_rate_limit ()
         }
         lua_pop (alfred_inst->ls, 1);
 
+        lua_getglobal (alfred_inst->ls, "count");
+        test_count = lua_tointeger(alfred_inst->ls, -1);
+        lua_pop (alfred_inst->ls, 1);
+
         g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+        g_assert (test_count < 50);
         apteryx_set ("/test/set_node", NULL);
         sleep(1);
     }
@@ -1937,6 +1945,7 @@ test_after_quiet ()
     FILE *library = NULL;
     FILE *data = NULL;
     char *test_str = NULL;
+    lua_Integer test_count;
 
     apteryx_init (false);
     /* Create library file + XML */
@@ -1945,8 +1954,10 @@ test_after_quiet ()
     if (library)
     {
         fprintf (library,
+                "count = 0\n\n"
                 "function test_library_function(test_str)\n"
                 "  test_value = test_str\n"
+                "  count = count + 1\n"
                 "end\n"
                 );
         fclose (library);
@@ -1998,7 +2009,12 @@ test_after_quiet ()
         }
         lua_pop (alfred_inst->ls, 1);
 
+        lua_getglobal (alfred_inst->ls, "count");
+        test_count = lua_tointeger(alfred_inst->ls, -1);
+        lua_pop (alfred_inst->ls, 1);
+
         g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
+        g_assert (test_count == 1);
         apteryx_set ("/test/set_node", NULL);
         sleep(1);
     }
