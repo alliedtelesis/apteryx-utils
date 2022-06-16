@@ -1944,8 +1944,6 @@ test_after_quiet ()
 {
     FILE *library = NULL;
     FILE *data = NULL;
-    char *test_str = NULL;
-    lua_Integer test_count;
 
     apteryx_init (false);
     /* Create library file + XML */
@@ -1954,12 +1952,18 @@ test_after_quiet ()
     if (library)
     {
         fprintf (library,
-                "count = 0\n\n"
-                "function test_library_function(test_str)\n"
-                "  test_value = test_str\n"
-                "  count = count + 1\n"
-                "end\n"
-                );
+                 "count = 0\n\n"
+                 "function test_library_function(test_str)\n"
+                 "  test_value = test_str\n"
+                 "  count = count + 1\n"
+                 "end\n\n"
+                 "function test_library_function2(...)\n"
+                 "  local args = table.pack(...)\n"
+                 "  test_value = \"CONCATED:\"\n"
+                 "  for i=1, args.n do\n"
+                 "    test_value = test_value .. tostring(args[i])\n"
+                 "  end\n"
+                 "end\n");
         fclose (library);
     }
 
@@ -1978,8 +1982,17 @@ test_after_quiet ()
                     "  end\n"
                     "  </SCRIPT>\n"
                     "  <NODE name=\"test\">\n"
-                    "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
-                    "      <WATCH>Alfred.after_quiet(0.1,'test_node_change(_value)')</WATCH>\n"
+                    "    <NODE name=\"set_script_node\" mode=\"rw\">\n"
+                    "      <WATCH>Alfred.after_quiet(0.1, 'test_node_change(_value)')</WATCH>\n"
+                    "    </NODE>\n"
+                    "    <NODE name=\"set_function_node\" mode=\"rw\">\n"
+                    "      <WATCH>Alfred.after_quiet(0.1, test_library_function2)</WATCH>\n"
+                    "    </NODE>\n"
+                    "    <NODE name=\"set_function_arg_node\" mode=\"rw\">\n"
+                    "      <WATCH>Alfred.after_quiet(0.1, test_library_function, _value)</WATCH>\n"
+                    "    </NODE>\n"
+                    "    <NODE name=\"set_function_many_args_node\" mode=\"rw\">\n"
+                    "      <WATCH>Alfred.after_quiet(0.1, test_library_function2, nil, 1, '\\\\2', 3, false, _value, true, nil, 4, '5', 6)</WATCH>\n"
                     "    </NODE>\n"
                     "  </NODE>\n"
                     "</MODULE>\n");
@@ -1991,32 +2004,58 @@ test_after_quiet ()
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
-        /* Trigger Action */
-        int count = 0;
+        char *test_str = NULL;
+        lua_Integer test_count;
+        struct {
+            const char *node;
+            const char *check;
+        } tests[4];
 
-        while (count < 50)
+        tests[0].node = "/test/set_script_node";
+        tests[0].check = "Goodnight scoot";
+        tests[1].node = "/test/set_function_node";
+        tests[1].check = "CONCATED:";
+        tests[2].node = "/test/set_function_arg_node";
+        tests[2].check = "Goodnight scoot";
+        tests[3].node = "/test/set_function_many_args_node";
+        tests[3].check = "CONCATED:nil1\\23falseGoodnight scoottruenil456";
+
+        for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
         {
-            apteryx_set ("/test/set_node", "Goodnight scoot");
-            count++;
+            int count = 0;
+
+            while (count < 50)
+            {
+                apteryx_set (tests[i].node, "Goodnight scoot");
+                count++;
+            }
+
+            sleep (1);
+            /* Check output */
+            lua_getglobal (alfred_inst->ls, "test_value");
+            if (!lua_isnil (alfred_inst->ls, -1))
+            {
+                test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+            }
+            lua_pop (alfred_inst->ls, 1);
+
+            lua_getglobal (alfred_inst->ls, "count");
+            test_count = lua_tointeger(alfred_inst->ls, -1);
+            lua_pop (alfred_inst->ls, 1);
+
+            g_assert (test_str && strcmp (test_str, tests[i].check) == 0);
+            g_assert (test_count == 1);
+
+            /* Reset Lua variables */
+            lua_pushnil(alfred_inst->ls);
+            lua_setglobal(alfred_inst->ls, "test_value");
+            lua_pushinteger (alfred_inst->ls, (lua_Integer)0);
+            lua_setglobal(alfred_inst->ls, "count");
+
+            apteryx_set (tests[i].node, NULL);
+            free (test_str);
+            sleep(1);
         }
-
-        sleep (1);
-        /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
-        {
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-        }
-        lua_pop (alfred_inst->ls, 1);
-
-        lua_getglobal (alfred_inst->ls, "count");
-        test_count = lua_tointeger(alfred_inst->ls, -1);
-        lua_pop (alfred_inst->ls, 1);
-
-        g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
-        g_assert (test_count == 1);
-        apteryx_set ("/test/set_node", NULL);
-        sleep(1);
     }
 
     /* Clean up */
@@ -2026,7 +2065,6 @@ test_after_quiet ()
     }
     unlink ("alfred_test.lua");
     unlink ("alfred_test.xml");
-    free (test_str);
 }
 
 static gboolean
