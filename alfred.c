@@ -92,6 +92,40 @@ alfred_error (lua_State *ls, int res)
 }
 
 static bool
+alfred_call (lua_State *ls, int nresults)
+{
+    int res, s_0 = lua_gettop (ls);
+    size_t fargs = lua_rawlen(ls, -1) - 1;
+
+    /* Load stack with function and its arguments from table */
+    for (size_t i = 1; i <= fargs + 1; i++)
+    {
+        lua_rawgeti(ls, s_0, i);
+    }
+
+    res = lua_pcall (ls, (int)(fargs), nresults, 0);
+    if (res != 0)
+        alfred_error (ls, res);
+
+    if (lua_gettop (ls) != (s_0 + nresults))
+    {
+        lua_Debug ar;
+
+        /* Push function back on the stack to get some details */
+        lua_rawgeti(ls, s_0, 1);
+        lua_getinfo(ls, ">nS", &ar);
+        printf ("Lua: Stack not zero(%d) after function: %s:%d:%s\n",
+                lua_gettop (ls),
+                ar.source && ar.source[0] != '\0' ? ar.source : "(unknown)",
+                ar.linedefined,
+                ar.name && ar.name[0] != '\0' ? ar.name : "(unknown)");
+        lua_pop(ls, 1);
+    }
+
+    return (res == 0);
+}
+
+static bool
 alfred_exec (lua_State *ls, const char *script, int nresults)
 {
     int res = 0;
@@ -753,6 +787,7 @@ load_script_files (alfred_instance alfred, const char *path)
 GList *delayed_work = NULL;
 struct delayed_work_s {
     guint id;
+    int call;
     char *script;
 };
 
@@ -760,6 +795,8 @@ static void
 dw_destroy (gpointer arg1)
 {
     struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
+    luaL_unref (alfred_inst->ls, LUA_REGISTRYINDEX, dw->call);
+    dw->call = LUA_NOREF;
     g_free (dw->script);
     g_free (dw);
 }
@@ -772,98 +809,150 @@ delayed_work_process (gpointer arg1)
     /* Remove the script to be run */
     delayed_work = g_list_remove (delayed_work, dw);
 
-    /* Execute the script */
-    alfred_exec (alfred_inst->ls, dw->script, 0);
+    if (dw->script)
+    {
+        /* Execute the script */
+        alfred_exec (alfred_inst->ls, dw->script, 0);
+    }
+    else
+    {
+        lua_rawgeti (alfred_inst->ls, LUA_REGISTRYINDEX, dw->call);
+        alfred_call (alfred_inst->ls, 0);
+        lua_pop (alfred_inst->ls, 0);
+    }
+
     return false;
 }
 
 static void
-delayed_work_add (int delay, const char *script, bool reset_timer)
+delayed_work_add (lua_State *ls, bool reset_timer)
 {
+    int call_args = 0;
     bool found = false;
+    const char *script = NULL;
     struct delayed_work_s *dw = NULL;
 
-    for (GList * iter = delayed_work; iter; iter = g_list_next (iter))
+    if (lua_isstring (ls, 2))
+    {
+        script = lua_tostring(ls, 2);
+    }
+    else /* lua_isfunction(ls, 2) */
+    {
+        call_args = lua_gettop (ls) - 1;
+    }
+
+    for (GList * iter = delayed_work; iter && !found; iter = g_list_next (iter))
     {
         dw = (struct delayed_work_s *) iter->data;
-        if (strcmp (script, dw->script) == 0)
+        if (script)
         {
-            found = true;
-            if (reset_timer)
+            found = dw->script && strcmp (script, dw->script) == 0;
+        }
+        else if (lua_isfunction (ls, 2)
+                 && dw->call != LUA_NOREF && dw->call != LUA_REFNIL)
+        {
+            size_t len;
+            bool call_same = true;
+
+            lua_rawgeti(ls, LUA_REGISTRYINDEX, dw->call);
+            /* Try to avoid comparing calls */
+            len = lua_rawlen(ls, -1);
+            if (((size_t)call_args) != len)
             {
-                delayed_work = g_list_remove (delayed_work, dw);
-                g_source_remove (dw->id);
+                lua_pop(ls, 1);
+                continue;
             }
-            break;
+            for (size_t i = 0; call_same && i < call_args; i++)
+            {
+                lua_rawgeti(ls, -1, i + 1);
+                /* lua_compare has the usual meaning in lua, tables with
+                 * the same keys and values will not be counted as the same,
+                 * unless metamethods are changed.
+                 */
+                call_same = lua_compare(ls, i + 2, -1, LUA_OPEQ);
+                lua_pop(ls, 1);
+            }
+            found = call_same;
+            lua_pop(ls, 1);
+        }
+        if (found && reset_timer)
+        {
+            delayed_work = g_list_remove (delayed_work, dw);
+            g_source_remove (dw->id);
         }
     }
+
     if (!found || reset_timer)
     {
-        dw = (struct delayed_work_s *) g_malloc0 (sizeof (struct delayed_work_s));
-        dw->script = g_strdup (script);
+        struct delayed_work_s *dw = (struct delayed_work_s *) g_malloc0 (sizeof (struct delayed_work_s));
+
+        if (script)
+        {
+            dw->script = g_strdup (script);
+        }
+        else
+        {
+            /* Transfer stack (past delay) into the argument table */
+            lua_newtable(ls);
+            lua_pushvalue(ls, 2);
+            lua_rawseti(ls, -2, 1);
+            lua_replace(ls, 2);
+            for (int i = lua_gettop (ls); i > 2; i--)
+            {
+                lua_rawseti(ls, 2, i - 1);
+            }
+            dw->call = luaL_ref(ls, LUA_REGISTRYINDEX);
+        }
         delayed_work = g_list_append (delayed_work, dw);
-        dw->id = g_timeout_add_full (G_PRIORITY_DEFAULT, delay, delayed_work_process,
-                                     (gpointer) dw, dw_destroy);
+        dw->id = g_timeout_add_full (G_PRIORITY_DEFAULT,
+                                     lua_tonumber (ls, 1) * SECONDS_TO_MILLI,
+                                     delayed_work_process, (gpointer) dw, dw_destroy);
     }
+}
+
+static int
+validate_script_or_function_args (lua_State *ls, const char *funct)
+{
+    bool success = true;
+
+    if (!lua_isnumber (ls, 1))
+    {
+        ERROR ("First argument to %s must be a number\n", funct);
+        success = false;
+    }
+    if (lua_isstring (ls, 2))
+    {
+        if (lua_gettop (ls) != 2)
+        {
+            ERROR ("%s takes 2 arguements\n", funct);
+            success = false;
+        }
+    }
+    else if (!lua_isfunction (ls, 2))
+    {
+        ERROR ("Second argument to %s must be a string or Lua function\n", funct);
+        success = false;
+    }
+    return success;
 }
 
 static int
 rate_limit (lua_State *ls)
 {
-    bool failure = false;
-    if (lua_gettop (ls) != 2)
+    if (validate_script_or_function_args (ls, "Alfred.rate_limit()"))
     {
-        ERROR ("Alfred.rate_limit() takes 2 arguements\n");
-        failure = true;
+        delayed_work_add (ls, false);
     }
-    if (!lua_isnumber (ls, 1))
-    {
-        ERROR ("First argument to Alfred.rate_limit() must be a number\n");
-        failure = true;
-    }
-    if (!lua_isstring (ls, 2))
-    {
-        ERROR ("Second argument to Alfred.rate_limit() must be a string\n");
-        failure = true;
-    }
-
-    if (failure)
-    {
-        return 0;
-    }
-
-    delayed_work_add (lua_tonumber (ls, 1) * SECONDS_TO_MILLI, lua_tostring (ls, 2), false);
-
     return 0;
 }
 
 static int
 after_quiet (lua_State *ls)
 {
-    bool failure = false;
-    if (lua_gettop (ls) != 2)
+    if (validate_script_or_function_args (ls, "Alfred.after_quiet()"))
     {
-        ERROR ("Alfred.after_quiet() takes 2 arguements\n");
-        failure = true;
+        delayed_work_add (ls, true);
     }
-    if (!lua_isnumber (ls, 1))
-    {
-        ERROR ("First argument to Alfred.after_quiet() must be a number\n");
-        failure = true;
-    }
-    if (!lua_isstring (ls, 2))
-    {
-        ERROR ("Second argument to Alfred.after_quiet() must be a string\n");
-        failure = true;
-    }
-
-    if (failure)
-    {
-        return 0;
-    }
-
-    delayed_work_add (lua_tonumber (ls, 1) * SECONDS_TO_MILLI, lua_tostring (ls, 2), true);
-
     return 0;
 }
 
