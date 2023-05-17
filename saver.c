@@ -17,7 +17,6 @@
  * along with this library. If not, see <http://www.gnu.org/licenses/>
  */
 #include <string.h>
-#include <libxml/xmlschemas.h>
 #include <apteryx.h>
 #include <apteryx-xml.h>
 #include <glib-unix.h>
@@ -131,52 +130,36 @@ _path_to_node (GNode *root, const char *path, const char *value)
     return;
 }
 
-static bool
-process_node (xmlNode *node, char *parent)
+static void
+process_node (sch_node *node, char *parent)
 {
-    xmlChar *name = NULL;
+    char *name = sch_name (node);
     char *path = NULL;
-    bool res = true;
-
-    /* Ignore fluff */
-    if (!node || node->type != XML_ELEMENT_NODE)
-    {
-        return true;
-    }
 
     /* Process this node */
-    if (strcmp ((const char *) node->name, "NODE") == 0)
+    if (parent)
     {
-        /* Find node name and path */
-        name = xmlGetProp (node, (xmlChar *) "name");
-        if (parent)
-        {
-            path = g_strdup_printf ("%s/%s", parent, name);
-        }
-        else
-        {
-            path = g_strdup_printf ("/%s", name);
-        }
-        if (sch_is_config (node))
-        {
-            DEBUG ("Schema: %s\n", path);
-            _path_to_node (saver_nodes, path, NULL);
-        }
+        path = g_strdup_printf ("%s/%s", parent, name);
     }
-    /* Process children */
-    for (xmlNode *n = node->children; n; n = n->next)
+    else
     {
-        if (!process_node (n, path))
-        {
-            res = false;
-            goto exit;
-        }
+        path = g_strdup_printf ("/%s", name);
+    }
+    if (sch_is_config (node))
+    {
+        DEBUG ("Schema: %s\n", path);
+        _path_to_node (saver_nodes, path, NULL);
     }
 
-  exit:
+    /* Process children */
+    for (sch_node *n = sch_node_child_first (node); n; n = sch_node_next_sibling (n))
+    {
+        process_node (n, path);
+    }
+
     g_free (path);
     g_free (name);
-    return res;
+    return;
 }
 
 bool
@@ -401,7 +384,10 @@ test_xml_to_nodes_basic ()
 
     /* Trigger Action */
     sch_instance *test_schemas = sch_load ("./");
-    process_node (test_schemas, NULL);
+    for (sch_node *n = sch_child_first (test_schemas); n; n = sch_node_next_sibling (n))
+    {
+        process_node (n, NULL);
+    }
 
     const char *nodes[2] = {"test", "set_node"};
     int i = 0;
