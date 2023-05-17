@@ -446,7 +446,10 @@ test_xml_to_nodes_no_mode ()
 
     /* Trigger Action */
     sch_instance *test_schemas = sch_load ("./");
-    process_node (test_schemas, NULL);
+    for (sch_node *n = sch_child_first (test_schemas); n; n = sch_node_next_sibling (n))
+    {
+        process_node (n, NULL);
+    }
 
     const char *nodes[2] = {"test", "set_node2"};
     int i = 0;
@@ -708,7 +711,10 @@ main (int argc, char *argv[])
 
     saver_nodes = g_node_new (g_strdup("/"));
     schemas = sch_load (schema_dir);
-    process_node (schemas, NULL);
+    for (sch_node *n = sch_child_first (schemas); n; n = sch_node_next_sibling (n))
+    {
+        process_node (n, NULL);
+    }
     parse_config_files (config_dir);
     if (load_startup_config)
     {
