@@ -75,7 +75,7 @@ apteryxd = \
 test: alfred
 	@echo "Running unit test: $<"
 	$(Q)$(call apteryxd,alfred -u)
-	$(Q)rm -f alfred_test.xml alfred_test.lua
+	$(Q)rm -f alfred_test.xml alfred_test.map alfred_test.lua
 	@echo "Tests have been run!"
 
 install: all

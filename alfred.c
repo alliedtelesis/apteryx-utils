@@ -53,6 +53,8 @@ struct alfred_instance_t
     GList *provides;
     /* List of indexes based on path */
     GList *indexes;
+    /* Mapping table */
+    GHashTable *map_hash_table;
 } alfred_instance_t;
 typedef struct alfred_instance_t *alfred_instance;
 
@@ -404,6 +406,7 @@ static bool
 process_node (alfred_instance alfred, xmlNode *node, char *parent)
 {
     xmlChar *name = NULL;
+    const char *mapping = NULL;
     xmlChar *content = NULL;
     char *path = NULL;
     char *tmp_content = NULL;
@@ -418,12 +421,19 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
     if (!node || node->type != XML_ELEMENT_NODE)
         return true;
 
+    /* Check for a root node mapping */
+    if (!parent && node->ns && alfred->map_hash_table)
+        mapping = (const char *) g_hash_table_lookup (alfred->map_hash_table,
+                                                      (const char *) node->ns->href);
+
     /* Process this node */
     if (strcmp ((const char *) node->name, "NODE") == 0)
     {
         /* Find node name and path */
         name = xmlGetProp (node, (xmlChar *) "name");
-        if (parent)
+        if (mapping)
+            path = g_strdup (mapping);
+        else if (parent)
             path = g_strdup_printf ("%s/%s", parent, name);
         else
             path = g_strdup_printf ("/%s", name);
@@ -559,6 +569,58 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
     return res;
 }
 
+static void
+sch_load_namespace_mappings (alfred_instance instance, const char *filename)
+{
+    FILE *fp = NULL;
+    gchar **ns_names;
+    char buf[256];
+
+    if (!instance)
+        return;
+
+    fp = fopen (filename, "r");
+    if (fp)
+    {
+        if (!instance->map_hash_table)
+            instance->map_hash_table = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+        while (fgets (buf, sizeof (buf), fp) != NULL)
+        {
+            /* Skip comment lines */
+            if (buf[0] == '#')
+                continue;
+
+            /* Remove any trailing LF */
+            buf[strcspn(buf, "\n")] = '\0';
+
+            ns_names = g_strsplit (buf, " ", 2);
+            if (ns_names[0] && ns_names[1])
+            {
+                void *old_key;
+                void *old_value;
+
+                /* Look up this node name to check for duplicates. */
+                if (g_hash_table_lookup_extended (instance->map_hash_table, ns_names[0],
+                                                  &old_key, &old_value))
+                {
+                    g_hash_table_insert (instance->map_hash_table, g_strdup (ns_names[0]),
+                                         g_strdup (ns_names[1]));
+                    g_free (old_key);
+                    g_free (old_value);
+                }
+                else
+                {
+                    g_hash_table_insert (instance->map_hash_table, g_strdup (ns_names[0]),
+                                         g_strdup (ns_names[1]));
+                }
+            }
+            g_strfreev (ns_names);
+        }
+        fclose (fp);
+    }
+}
+
 static bool
 load_config_files (alfred_instance alfred, const char *path)
 {
@@ -604,6 +666,23 @@ load_config_files (alfred_instance alfred, const char *path)
                 res = false;
                 goto exit;
             }
+        }
+    }
+    rewinddir (dir);
+
+    /* Load all the mapping files */
+    for (entry = readdir (dir); entry; entry = readdir (dir))
+    {
+        const char *ext = strchr (entry->d_name, '.');
+        if (ext && strcmp (".map", ext) == 0)
+        {
+            /* Full path */
+            char *filename = g_strdup_printf ("%s%s%s", path,
+                path[strlen (path) - 1] == '/' ? "" : "/", entry->d_name);
+
+            DEBUG ("ALFRED: Parse MAP file \"%s\"\n", filename);
+            sch_load_namespace_mappings (alfred, filename);
+            g_free (filename);
         }
     }
     rewinddir (dir);
@@ -800,6 +879,9 @@ alfred_shutdown (void)
     if (alfred_inst->ls)
         lua_close (alfred_inst->ls);
 
+    if (alfred_inst->map_hash_table)
+        g_hash_table_destroy (alfred_inst->map_hash_table);
+
     g_free (alfred_inst);
     alfred_inst = NULL;
     return;
@@ -947,6 +1029,92 @@ test_simple_watch ()
         alfred_shutdown ();
     }
     unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
+    free (test_str);
+}
+
+void
+test_ns_watch ()
+{
+    FILE *library = NULL;
+    FILE *mapping = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (library)
+    {
+        fprintf (library,
+                "function test_library_function(test_str)\n"
+                "  test_value = test_str\n"
+                "end\n"
+                );
+        fclose (library);
+    }
+
+    mapping = fopen ("alfred_test.map", "w");
+    g_assert (mapping != NULL);
+    if (mapping)
+    {
+        fprintf (mapping, "http://test.com/ns/yang/testing-2 /t2:test\n");
+        fclose (mapping);
+    }
+
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (data)
+    {
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"http://test.com/ns/yang/testing-2\"\n"
+                   "  xmlns:t2=\"http://test.com/ns/yang/testing-2\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\"\n"
+                   "  model=\"testing-2\" organization=\"Test 2 Ltd\" version=\"2023-02-01\">\n"
+                   "  <SCRIPT>\n"
+                   "  function test_node_change(new_value)\n"
+                   "    test_library_function(new_value)\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"set_node\" mode=\"rw\"  help=\"Set this node to test the watch function\">\n"
+                   "      <WATCH>test_node_change(_value)</WATCH>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+        fclose (data);
+    }
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
+    {
+        /* Trigger Action */
+        apteryx_set ("/t2:test/set_node", "Goodnight moon");
+        sleep (1);
+
+        /* Check output */
+        lua_getglobal (alfred_inst->ls, "test_value");
+        if (!lua_isnil (alfred_inst->ls, -1))
+        {
+            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+        }
+        lua_pop (alfred_inst->ls, 1);
+
+        g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
+        apteryx_set ("/t2:test/set_node", NULL);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.map");
     unlink ("alfred_test.xml");
     free (test_str);
 }
@@ -1280,6 +1448,92 @@ test_simple_refresh ()
     {
         alfred_shutdown ();
     }
+    unlink ("alfred_test.xml");
+}
+
+void
+test_ns_refresh ()
+{
+    FILE *mapping = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+    GList *paths = NULL;
+
+    /* Create namespace mapping */
+    mapping = fopen ("alfred_test.map", "w");
+    g_assert (mapping != NULL);
+    if (mapping)
+    {
+        fprintf (mapping, "http://test.com/ns/yang/testing-2 /t2:test\n");
+        fclose (mapping);
+    }
+
+    /* Create XML */
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (data)
+    {
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                   "<MODULE xmlns=\"http://test.com/ns/yang/testing-2\"\n"
+                   "  xmlns:t2=\"http://test.com/ns/yang/testing-2\"\n"
+                   "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                   "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                   "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\"\n"
+                   "  model=\"testing-2\" organization=\"Test 2 Ltd\" version=\"2023-02-01\">\n"
+                   "  <SCRIPT>\n"
+                   "  count = 0\n"
+                   "  function test_refresh(path)\n"
+                   "    apteryx.set('/t2:test/eth0/refresh/count', tostring(count))\n"
+                   "    count = count + 1\n"
+                   "    return 500000\n"
+                   "  end\n"
+                   "  </SCRIPT>\n"
+                   "  <NODE name=\"test\">\n"
+                   "    <NODE name=\"*\">\n"
+                   "      <NODE name=\"refresh\">\n"
+                   "        <NODE name=\"count\" mode=\"rw\" help=\"Get this node to test the refresh function\" />\n"
+                   "        <REFRESH>return test_refresh(_path)</REFRESH>\n"
+                   "      </NODE>\n"
+                   "    </NODE>\n"
+                   "  </NODE>\n"
+                   "</MODULE>\n");
+        fclose (data);
+    }
+
+    /* Init */
+    alfred_init ("./");
+    g_assert (alfred_inst != NULL);
+    if (alfred_inst)
+    {
+        sleep (1);
+
+        /* Search */
+        paths = apteryx_search ("/t2:test/eth0/refresh/");
+        g_assert (g_list_length (paths) == 1);
+        g_assert (paths && (strcmp ((char *) paths->data, "/t2:test/eth0/refresh/count") == 0));
+        g_list_free_full (paths, free);
+        usleep (500000);
+
+        /* Trigger refresh */
+        test_str = apteryx_get ("/t2:test/eth0/refresh/count");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        test_str = apteryx_get ("/t2:test/eth0/refresh/count");
+        g_assert (test_str && strcmp (test_str, "1") == 0);
+        free (test_str);
+        usleep (500000);
+        test_str = apteryx_get ("/t2:test/eth0/refresh/count");
+        g_assert (test_str && strcmp (test_str, "2") == 0);
+        free (test_str);
+        apteryx_set ("/t2:test/eth0/refresh/count", NULL);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.map");
     unlink ("alfred_test.xml");
 }
 
@@ -1740,9 +1994,11 @@ main (int argc, char *argv[])
 
         g_test_init (&argc, &argv, NULL);
         g_test_add_func ("/test_simple_watch", test_simple_watch);
+        g_test_add_func ("/test_ns_watch", test_ns_watch);
         g_test_add_func ("/test_native_watch", test_native_watch);
         g_test_add_func ("/test_dir_watch", test_dir_watch);
         g_test_add_func ("/test_simple_refresh", test_simple_refresh);
+        g_test_add_func ("/test_ns_refresh", test_ns_refresh);
         g_test_add_func ("/test_native_refresh", test_native_refresh);
         g_test_add_func ("/test_simple_provide", test_simple_provide);
         g_test_add_func ("/test_native_provide", test_native_provide);
