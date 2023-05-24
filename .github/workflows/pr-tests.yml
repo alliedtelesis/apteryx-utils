@@ -1,0 +1,33 @@
+name: Run unit tests
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install dependencies
+      run: sudo apt-get install -y build-essential libglib2.0-dev libxml2-dev liblua5.3-dev
+    - name: Clone apteryx
+      uses: actions/checkout@v2
+      with:
+        repository: alliedtelesis/apteryx
+        path: apteryx
+    - name: Build Apteryx
+      run: make -C ./apteryx
+    - name: Clone apteryx-xml
+      uses: actions/checkout@v2
+      with:
+        repository: alliedtelesis/apteryx-xml
+        path: apteryx-xml
+    - name: Build apteryx-xml
+      run: make -C ./apteryx-xml
+    - name: Build
+      run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=../apteryx-xml make
+    - name: Run tests
+      run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=../apteryx-xml make test
