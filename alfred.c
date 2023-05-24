@@ -1358,7 +1358,7 @@ test_simple_index ()
     {
         fprintf (library,
             "function test_library_function()\n"
-            "  return {\"Goodnight light\", \"and the red balloon\"}\n"
+            "  return {\"/test/id1\", \"/test/id2\"}\n"
             "end\n"
             );
         fclose (library);
@@ -1397,11 +1397,11 @@ test_simple_index ()
         paths = apteryx_search ("/test/");
 
         g_assert (g_list_length (paths) == 2);
-        g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
-                strcmp ((char *) paths->data, "and the red balloon") == 0));
+        g_assert (paths && (strcmp ((char *) paths->data, "/test/id1") == 0 ||
+                strcmp ((char *) paths->data, "/test/id2") == 0));
         g_assert (paths && paths->next &&
-                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
-                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+                (strcmp ((char *) paths->next->data, "/test/id1") == 0 ||
+                strcmp ((char *) paths->next->data, "/test/id2") == 0));
         g_assert (paths && paths->next &&
                 (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     }
@@ -1434,7 +1434,7 @@ test_native_index ()
         fprintf (library,
                 "function test_node_index(path)\n"
                 "  apteryx.unindex('/test', test_node_index)\n"
-                "  return {\"Goodnight light\", \"and the red balloon\"}\n"
+                "  return {\"/test/id1\", \"/test/id2\"}\n"
                 "end\n"
                 "apteryx.index('/test', test_node_index)\n"
                 );
@@ -1450,11 +1450,11 @@ test_native_index ()
         paths = apteryx_search ("/test/");
 
         g_assert (g_list_length (paths) == 2);
-        g_assert (paths && (strcmp ((char *) paths->data, "Goodnight light") == 0 ||
-                strcmp ((char *) paths->data, "and the red balloon") == 0));
+        g_assert (paths && (strcmp ((char *) paths->data, "/test/id1") == 0 ||
+                strcmp ((char *) paths->data, "/test/id1") == 0));
         g_assert (paths && paths->next &&
-                (strcmp ((char *) paths->next->data, "and the red balloon") == 0 ||
-                strcmp ((char *) paths->next->data, "Goodnight light") == 0));
+                (strcmp ((char *) paths->next->data, "/test/id1") == 0 ||
+                strcmp ((char *) paths->next->data, "/test/id2") == 0));
         g_assert (paths && paths->next &&
                 (strcmp ((char *) paths->data, (char *) paths->next->data) != 0));
     }

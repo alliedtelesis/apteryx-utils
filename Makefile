@@ -68,8 +68,8 @@ apteryxd = \
 	fi; \
 	rm -f /tmp/apteryxd.pid; \
 	rm -f /tmp/apteryxd.run; \
-	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./ $(APTERYX_PATH)apteryxd -b -p /tmp/apteryxd.pid -r /tmp/apteryxd.run && sleep 0.1; \
-	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./ $(TEST_WRAPPER) ./$(1); \
+	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH) $(APTERYX_PATH)/apteryxd -b -p /tmp/apteryxd.pid -r /tmp/apteryxd.run && sleep 0.1; \
+	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH) $(TEST_WRAPPER) ./$(1); \
 	kill -TERM `cat /tmp/apteryxd.pid`;
 
 test: alfred
