@@ -26,7 +26,7 @@ jobs:
         repository: alliedtelesis/apteryx-xml
         path: apteryx-xml
     - name: Build apteryx-xml
-      run: APTERYX_PATH=./apteryx make -C ./apteryx-xml
+      run: APTERYX_PATH=../apteryx make -C ./apteryx-xml
     - name: Build
       run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=../apteryx-xml make
     - name: Run tests
