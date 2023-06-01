@@ -33,8 +33,9 @@
 #include "common.h"
 
 /* Change the following to alfred*/
-#define APTERYX_ALFRED_PID "/var/run/apteryx-alfred.pid"
-#define APTERYX_CONFIG_DIR "/etc/apteryx/schema/"
+#define ALFRED_PID "/var/run/apteryx-alfred.pid"
+#define ALFRED_CONFIG_DIR "/etc/apteryx/schema/"
+#define ALFRED_SCRIPT_DIR "/usr/share/alfred/"
 #define SECONDS_TO_MILLI 1000
 
 /* Debug */
@@ -632,43 +633,9 @@ load_config_files (alfred_instance alfred, const char *path)
     dir = opendir (path);
     if (dir == NULL)
     {
-        DEBUG ("XML: Failed to open \"%s\"", path);
+        DEBUG ("ALFRED: Failed to open \"%s\"", path);
         return false;
     }
-
-    /* Load all libraries first */
-    for (entry = readdir (dir); entry; entry = readdir (dir))
-    {
-        const char *ext = strrchr (entry->d_name, '.');
-        if (ext && strcmp (".lua", ext) == 0)
-        {
-            char *filename = g_strdup_printf ("%s/%s", path, entry->d_name);
-            int error;
-
-            DEBUG ("ALFRED: Load Lua file \"%s\"\n", filename);
-
-            /* Execute the script */
-            lua_getglobal (alfred->ls, "debug");
-            lua_getfield (alfred->ls, -1, "traceback");
-            error = luaL_loadfile (alfred->ls, filename);
-            if (error == 0)
-                error = lua_pcall (alfred->ls, 0, 0, 0);
-            if (error != 0)
-                alfred_error (alfred->ls, error);
-            g_free (filename);
-
-            while (lua_gettop (alfred->ls))
-                lua_pop (alfred->ls, 1);
-
-            /* Stop processing files if there has been an error */
-            if (error != 0)
-            {
-                res = false;
-                goto exit;
-            }
-        }
-    }
-    rewinddir (dir);
 
     /* Load all the mapping files */
     for (entry = readdir (dir); entry; entry = readdir (dir))
@@ -714,6 +681,59 @@ load_config_files (alfred_instance alfred, const char *path)
             /* Stop processing files if there has been an error */
             if (!res)
                 goto exit;
+        }
+    }
+
+  exit:
+    closedir (dir);
+    return res;
+}
+
+static bool
+load_script_files (alfred_instance alfred, const char *path)
+{
+    struct dirent *entry;
+    DIR *dir;
+    bool res = true;
+
+    /* Find all the LUA files in this folder */
+    dir = opendir (path);
+    if (dir == NULL)
+    {
+        DEBUG ("ALFRED: Failed to open \"%s\"", path);
+        return false;
+    }
+
+    /* Load and execute all LUA files */
+    for (entry = readdir (dir); entry; entry = readdir (dir))
+    {
+        const char *ext = strrchr (entry->d_name, '.');
+        if (ext && strcmp (".lua", ext) == 0)
+        {
+            char *filename = g_strdup_printf ("%s/%s", path, entry->d_name);
+            int error;
+
+            DEBUG ("ALFRED: Load Lua file \"%s\"\n", filename);
+
+            /* Execute the script */
+            lua_getglobal (alfred->ls, "debug");
+            lua_getfield (alfred->ls, -1, "traceback");
+            error = luaL_loadfile (alfred->ls, filename);
+            if (error == 0)
+                error = lua_pcall (alfred->ls, 0, 0, 0);
+            if (error != 0)
+                alfred_error (alfred->ls, error);
+            g_free (filename);
+
+            while (lua_gettop (alfred->ls))
+                lua_pop (alfred->ls, 1);
+
+            /* Stop processing files if there has been an error */
+            if (error != 0)
+            {
+                res = false;
+                goto exit;
+            }
         }
     }
 
@@ -888,9 +908,9 @@ alfred_shutdown (void)
 }
 
 void
-alfred_init (const char *path)
+alfred_init (const char *config_dir, const char *script_dir)
 {
-    assert (path);
+    assert (config_dir && script_dir);
 
     /* Malloc memory for the new service */
     alfred_inst = (alfred_instance) g_malloc0 (sizeof (*alfred_inst));
@@ -932,8 +952,14 @@ alfred_init (const char *path)
     lua_setfield (alfred_inst->ls, -2, "after_quiet");
     lua_setglobal (alfred_inst->ls, "Alfred");
 
-    /* Parse files in the config path */
-    if (!load_config_files (alfred_inst, path))
+    /* Load alfred lua scripts first */
+    if (!load_script_files (alfred_inst, script_dir))
+    {
+        goto error;
+    }
+
+    /* Load schema with alfred tags second */
+    if (!load_config_files (alfred_inst, config_dir))
     {
         goto error;
     }
@@ -1003,7 +1029,7 @@ test_simple_watch ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1088,7 +1114,7 @@ test_ns_watch ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1141,7 +1167,7 @@ test_native_watch ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1217,7 +1243,7 @@ test_dir_watch ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1317,7 +1343,7 @@ test_simple_provide ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1360,7 +1386,7 @@ test_native_provide ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1416,7 +1442,7 @@ test_simple_refresh ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1501,7 +1527,7 @@ test_ns_refresh ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1565,7 +1591,7 @@ test_native_refresh ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1643,7 +1669,7 @@ test_simple_index ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1696,7 +1722,7 @@ test_native_index ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1772,7 +1798,7 @@ test_rate_limit ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1855,7 +1881,7 @@ test_after_quiet ()
     }
 
     /* Init */
-    alfred_init ("./");
+    alfred_init ("./", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1919,21 +1945,23 @@ termination_handler (gpointer arg1)
 void
 help (char *app_name)
 {
-    printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-c <configdir>] [-u <filter>]\n"
+    printf ("Usage: %s [-h] [-b] [-d] [-p <pidfile>] [-c <configdir>] [-s <scriptdir>] [-u <filter>]\n"
             "  -h   show this help\n"
             "  -b   background mode\n"
             "  -d   enable verbose debug\n"
             "  -m   memory profiling\n"
-            "  -p   use <pidfile> (defaults to "APTERYX_ALFRED_PID")\n"
-            "  -c   use <configdir> (defaults to "APTERYX_CONFIG_DIR")\n"
+            "  -p   use <pidfile> (defaults to "ALFRED_PID")\n"
+            "  -c   use <configdir> (defaults to "ALFRED_CONFIG_DIR")\n"
+            "  -s   use <scriptdir> (defaults to "ALFRED_SCRIPT_DIR")\n"
             ,app_name);
 }
 
 int
 main (int argc, char *argv[])
 {
-    const char *pid_file = APTERYX_ALFRED_PID;
-    const char *config_dir = APTERYX_CONFIG_DIR;
+    const char *pid_file = ALFRED_PID;
+    const char *config_dir = ALFRED_CONFIG_DIR;
+    const char *script_dir = ALFRED_SCRIPT_DIR;
     int i = 0;
     bool background = false;
     FILE *fp = NULL;
@@ -1941,7 +1969,7 @@ main (int argc, char *argv[])
     bool unit_test = false;
 
     /* Parse options */
-    while ((i = getopt (argc, argv, "hdbp:c:mu::")) != -1)
+    while ((i = getopt (argc, argv, "hdbp:c:s:mu::")) != -1)
     {
         switch (i)
         {
@@ -1957,6 +1985,9 @@ main (int argc, char *argv[])
             break;
         case 'c':
             config_dir = optarg;
+            break;
+        case 's':
+            script_dir = optarg;
             break;
         case 'u':
             unit_test = true;
@@ -2020,7 +2051,7 @@ main (int argc, char *argv[])
     else
     {
         /* Create the alfred glists */
-        alfred_init (config_dir);
+        alfred_init (config_dir, script_dir);
         if (!alfred_inst)
             goto exit;
     }
