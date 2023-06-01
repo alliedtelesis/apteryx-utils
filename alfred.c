@@ -633,8 +633,9 @@ load_config_files (alfred_instance alfred, const char *path)
     dir = opendir (path);
     if (dir == NULL)
     {
-        DEBUG ("ALFRED: Failed to open \"%s\"", path);
-        return false;
+        /* Not a critical error - but let someone know */
+        NOTICE ("ALFRED: No config files in \"%s\"", path);
+        return true;
     }
 
     /* Load all the mapping files */
@@ -669,18 +670,22 @@ load_config_files (alfred_instance alfred, const char *path)
             xmlDoc *doc = xmlParseFile (filename);
             if (doc == NULL)
             {
-                ERROR ("ALFRED: Invalid file \"%s\"\n", filename);
+                CRITICAL ("ALFRED: Invalid file \"%s\"\n", filename);
                 g_free (filename);
                 res = false;
                 goto exit;
             }
             res = process_node (alfred, xmlDocGetRootElement (doc), NULL);
             xmlFreeDoc (doc);
-            g_free (filename);
 
             /* Stop processing files if there has been an error */
             if (!res)
+            {
+                CRITICAL ("ALFRED: Failed to process \"%s\"\n", filename);
+                g_free (filename);
                 goto exit;
+            }
+            g_free (filename);
         }
     }
 
@@ -700,8 +705,9 @@ load_script_files (alfred_instance alfred, const char *path)
     dir = opendir (path);
     if (dir == NULL)
     {
-        DEBUG ("ALFRED: Failed to open \"%s\"", path);
-        return false;
+        /* Not a critical error - but let someone know */
+        NOTICE ("ALFRED: No script files in \"%s\"", path);
+        return true;
     }
 
     /* Load and execute all LUA files */
@@ -723,7 +729,6 @@ load_script_files (alfred_instance alfred, const char *path)
                 error = lua_pcall (alfred->ls, 0, 0, 0);
             if (error != 0)
                 alfred_error (alfred->ls, error);
-            g_free (filename);
 
             while (lua_gettop (alfred->ls))
                 lua_pop (alfred->ls, 1);
@@ -731,9 +736,12 @@ load_script_files (alfred_instance alfred, const char *path)
             /* Stop processing files if there has been an error */
             if (error != 0)
             {
+                CRITICAL ("ALFRED: Invalid file \"%s\"\n", filename);
+                g_free (filename);
                 res = false;
                 goto exit;
             }
+            g_free (filename);
         }
     }
 
@@ -910,8 +918,6 @@ alfred_shutdown (void)
 void
 alfred_init (const char *config_dir, const char *script_dir)
 {
-    assert (config_dir && script_dir);
-
     /* Malloc memory for the new service */
     alfred_inst = (alfred_instance) g_malloc0 (sizeof (*alfred_inst));
     if (!alfred_inst)
@@ -924,7 +930,7 @@ alfred_init (const char *config_dir, const char *script_dir)
     alfred_inst->ls = luaL_newstate ();
     if (!alfred_inst->ls)
     {
-        CRITICAL ("XML: Failed to instantiate Lua interpreter\n");
+        CRITICAL ("ALFRED: Failed to instantiate Lua interpreter\n");
         goto error;
     }
 
@@ -941,7 +947,7 @@ alfred_init (const char *config_dir, const char *script_dir)
      */
     if (luaL_dostring (alfred_inst->ls, "require('api')") != 0)
     {
-        ERROR ("Lua: Failed to require('api')\n");
+        ERROR ("ALFRED: Failed to require('api')\n");
     }
 
     /* Add the rate_limit,after_quiet functions to a Lua table so it can be called using Lua */
@@ -953,13 +959,13 @@ alfred_init (const char *config_dir, const char *script_dir)
     lua_setglobal (alfred_inst->ls, "Alfred");
 
     /* Load alfred lua scripts first */
-    if (!load_script_files (alfred_inst, script_dir))
+    if (script_dir && !load_script_files (alfred_inst, script_dir))
     {
         goto error;
     }
 
     /* Load schema with alfred tags second */
-    if (!load_config_files (alfred_inst, config_dir))
+    if (config_dir && !load_config_files (alfred_inst, config_dir))
     {
         goto error;
     }
@@ -1969,7 +1975,7 @@ main (int argc, char *argv[])
     bool unit_test = false;
 
     /* Parse options */
-    while ((i = getopt (argc, argv, "hdbp:c:s:mu::")) != -1)
+    while ((i = getopt (argc, argv, "hdbp:c::s::mu::")) != -1)
     {
         switch (i)
         {
@@ -1998,6 +2004,13 @@ main (int argc, char *argv[])
             help (argv[0]);
             return 0;
         }
+    }
+
+    /* Alfred does not do anything without config */
+    if (!config_dir && !config_dir)
+    {
+        CRITICAL ("ALFRED: No configuration file paths set\n");
+        goto exit;
     }
 
     /* Daemonize */
