@@ -2007,7 +2007,7 @@ main (int argc, char *argv[])
     }
 
     /* Alfred does not do anything without config */
-    if (!config_dir && !config_dir)
+    if (!config_dir && !script_dir)
     {
         CRITICAL ("ALFRED: No configuration file paths set\n");
         goto exit;
