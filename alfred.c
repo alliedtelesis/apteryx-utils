@@ -45,7 +45,6 @@ bool apteryx_debug = false;
 struct alfred_instance_t
 {
     /* Lua state */
-    lua_State *ls;
     /* List of watches based on path */
     GList *watches;
     /* List of refreshers based on path */
@@ -61,9 +60,13 @@ typedef struct alfred_instance_t *alfred_instance;
 
 /* The one and only instance */
 alfred_instance alfred_inst = NULL;
-static int alfred_apteryx_fd = -1;
+GHashTable *lua_instances = NULL;
 
 int luaopen_apteryx (lua_State *L);
+int lua_apteryx_close (lua_State *L);
+bool lua_apteryx_instance_lock (lua_State *L);
+void lua_apteryx_instance_unlock (lua_State *L);
+static lua_State *alfred_new_instance(const char *key);
 
 static void
 alfred_error (lua_State *ls, int res)
@@ -173,16 +176,21 @@ watch_node_changed (const char *path, const char *value)
         scripts = (GList *) (long) cb->cb;
         for (script = g_list_first (scripts); script != NULL; script = g_list_next (script))
         {
-            lua_pushstring (alfred_inst->ls, path);
-            lua_setglobal (alfred_inst->ls, "_path");
-            lua_pushstring (alfred_inst->ls, value);
-            lua_setglobal (alfred_inst->ls, "_value");
-            ret = alfred_exec (alfred_inst->ls, script->data, 0);
+            if (lua_apteryx_instance_lock (cb->instance))
+            {
+                lua_pushstring (cb->instance, path);
+                lua_setglobal (cb->instance, "_path");
+                lua_pushstring (cb->instance, value);
+                lua_setglobal (cb->instance, "_value");
+                ret = alfred_exec (cb->instance, script->data, 0);
+                lua_gc (cb->instance, LUA_GCCOUNT, 0);
+                DEBUG ("LUA: Stack:%d Memory:%dkb\n", lua_gettop (cb->instance),
+                lua_gc (cb->instance, LUA_GCCOUNT, 0));
+                lua_apteryx_instance_unlock (cb->instance);
+            }
         }
     }
     g_list_free_full (matches, (GDestroyNotify) cb_release);
-    DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (alfred_inst->ls),
-            lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
     DEBUG ("ALFRED WATCH: %s = %s\n", path, value);
     return ret;
 }
@@ -190,7 +198,7 @@ watch_node_changed (const char *path, const char *value)
 uint64_t
 refresh_node_changed (const char *path)
 {
-    uint64_t timeout;
+    uint64_t timeout = 0;
     GList *matches = NULL;
     char *script = NULL;
     cb_info_t *cb = NULL;
@@ -205,24 +213,29 @@ refresh_node_changed (const char *path)
 
     cb = g_list_first (matches)->data;
     script = (char *) (long) cb->cb;
-    lua_pushstring (alfred_inst->ls, path);
-    lua_setglobal (alfred_inst->ls, "_path");
-    s_0 = lua_gettop (alfred_inst->ls);
-    if (!alfred_exec (alfred_inst->ls, script, 1))
-    {
-        ERROR ("Lua: Failed to execute refresh script for path: %s\n", path);
-    }
-    g_list_free_full (matches, (GDestroyNotify) cb_release);
-    /* The return value of luaL_dostring is the top value of the stack */
-    timeout = lua_tonumber (alfred_inst->ls, -1);
-    lua_pop (alfred_inst->ls, 1);
 
-    DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (alfred_inst->ls),
-            lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
-    if (lua_gettop (alfred_inst->ls) != s_0)
+    if(lua_apteryx_instance_lock (cb->instance))
     {
-        ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
-                lua_gettop (alfred_inst->ls), path);
+        lua_pushstring (cb->instance, path);
+        lua_setglobal (cb->instance, "_path");
+        s_0 = lua_gettop (cb->instance);
+        if (!alfred_exec (cb->instance, script, 1))
+        {
+            ERROR ("Lua: Failed to execute refresh script for path: %s\n", path);
+        }
+        g_list_free_full (matches, (GDestroyNotify) cb_release);
+        /* The return value of luaL_dostring is the top value of the stack */
+        timeout = lua_tonumber (cb->instance, -1);
+        lua_pop (cb->instance, 1);
+
+        DEBUG ("LUA: Stack:%d Memory:%dkb\n", lua_gettop (cb->instance),
+               lua_gc (cb->instance, LUA_GCCOUNT, 0));
+        if (lua_gettop (cb->instance) != s_0)
+        {
+            ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
+                   lua_gettop (cb->instance), path);
+        }
+        lua_apteryx_instance_unlock (cb->instance);
     }
     return timeout;
 }
@@ -246,24 +259,29 @@ provide_node_changed (const char *path)
 
     cb = g_list_first (matches)->data;
     script = (char *) (long) cb->cb;
-    lua_pushstring (alfred_inst->ls, path);
-    lua_setglobal (alfred_inst->ls, "_path");
-    s_0 = lua_gettop (alfred_inst->ls);
-    if (!alfred_exec (alfred_inst->ls, script, 1))
+
+    if (lua_apteryx_instance_lock (cb->instance))
     {
-        ERROR ("Lua: Failed to execute provide script for path: %s\n", path);
-    }
-    g_list_free_full (matches, (GDestroyNotify) cb_release);
-    /* The return value of luaL_dostring is the top value of the stack */
-    const_value = lua_tostring (alfred_inst->ls, -1);
-    lua_pop (alfred_inst->ls, 1);
-    ret = g_strdup (const_value);
-    DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (alfred_inst->ls),
-            lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
-    if (lua_gettop (alfred_inst->ls) != s_0)
-    {
-        ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
-                lua_gettop (alfred_inst->ls), path);
+        lua_pushstring (cb->instance, path);
+        lua_setglobal (cb->instance, "_path");
+        s_0 = lua_gettop (cb->instance);
+        if (!alfred_exec (cb->instance, script, 1))
+        {
+            ERROR ("Lua: Failed to execute provide script for path: %s\n", path);
+        }
+        g_list_free_full (matches, (GDestroyNotify) cb_release);
+        /* The return value of luaL_dostring is the top value of the stack */
+        const_value = lua_tostring (cb->instance, -1);
+        lua_pop (cb->instance, 1);
+        ret = g_strdup (const_value);
+        DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop (cb->instance),
+              lua_gc (cb->instance, LUA_GCCOUNT, 0));
+        if (lua_gettop (cb->instance) != s_0)
+        {
+            ERROR ("Lua: Stack not zero(%d) after provide: %s\n",
+                    lua_gettop (cb->instance), path);
+        }
+        lua_apteryx_instance_unlock(cb->instance);
     }
     return ret;
 }
@@ -287,37 +305,41 @@ index_node_changed (const char *path)
     }
     cb = g_list_first (matches)->data;
     script = (char *) (long) cb->cb;
-    lua_pushstring (alfred_inst->ls, path);
-    lua_setglobal (alfred_inst->ls, "_path");
-    s_0 = lua_gettop (alfred_inst->ls);
-    if (!alfred_exec (alfred_inst->ls, script, 1))
+    if (lua_apteryx_instance_lock (cb->instance))
     {
-        ERROR ("Lua: Failed to execute index script for path: %s\n", path);
-    }
-    g_list_free_full (matches, (GDestroyNotify) cb_release);
-
-    if (lua_gettop (alfred_inst->ls))
-    {
-        if (lua_istable(alfred_inst->ls, -1))
+        lua_pushstring (cb->instance, path);
+        lua_setglobal (cb->instance, "_path");
+        s_0 = lua_gettop (cb->instance);
+        if (!alfred_exec (cb->instance, script, 1))
         {
-            lua_pushnil (alfred_inst->ls);
-            while (lua_next(alfred_inst->ls, -2) != 0)
-            {
-                tmp_path = lua_tostring (alfred_inst->ls, -1);
-                tmp_path2 = strdup (tmp_path);
-                ret = g_list_append (ret, tmp_path2);
-                /* Removes 'value'; keeps 'key' for next iteration */
-                lua_pop (alfred_inst->ls, 1);
-            }
-            lua_pop (alfred_inst->ls, 1);
+            ERROR ("Lua: Failed to execute index script for path: %s\n", path);
         }
-    }
-    DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop(alfred_inst->ls),
-            lua_gc (alfred_inst->ls, LUA_GCCOUNT, 0));
-    if (lua_gettop (alfred_inst->ls) != s_0)
-    {
-        ERROR ("Lua: Stack not zero(%d) after index: %s\n",
-                lua_gettop (alfred_inst->ls), path);
+        g_list_free_full (matches, (GDestroyNotify) cb_release);
+
+        if (lua_gettop (cb->instance))
+        {
+            if (lua_istable (cb->instance, -1))
+            {
+                lua_pushnil (cb->instance);
+                while (lua_next(cb->instance, -2) != 0)
+                {
+                    tmp_path = lua_tostring (cb->instance, -1);
+                    tmp_path2 = strdup (tmp_path);
+                    ret = g_list_append (ret, tmp_path2);
+                    /* Removes 'value'; keeps 'key' for next iteration */
+                    lua_pop (cb->instance, 1);
+                }
+                lua_pop (cb->instance, 1);
+            }
+        }
+        DEBUG("LUA: Stack:%d Memory:%dkb\n", lua_gettop(cb->instance),
+              lua_gc (cb->instance, LUA_GCCOUNT, 0));
+        if (lua_gettop (cb->instance) != s_0)
+        {
+            ERROR ("Lua: Stack not zero(%d) after index: %s\n",
+                   lua_gettop (cb->instance), path);
+        }
+        lua_apteryx_instance_unlock (cb->instance);
     }
     return ret;
 }
@@ -438,7 +460,7 @@ node_is_leaf (xmlNode *node)
 }
 
 static bool
-process_node (alfred_instance alfred, xmlNode *node, char *parent)
+process_node (alfred_instance alfred, lua_State *instance, xmlNode *node, char *parent)
 {
     xmlChar *name = NULL;
     const char *mapping = NULL;
@@ -496,13 +518,16 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         if (matches == NULL)
         {
             scripts = g_list_append (scripts, tmp_content);
-            cb = cb_create (&alfred->watches, "", (const char *) path, 0,
+            cb = cb_create (&alfred->watches, instance, "", (const char *) path, 0,
                             (uint64_t) (long) scripts);
         }
         else
         {
             /* A watch already exists on that exact path */
             cb = matches->data;
+            /* Watch callbacks on the same path from a different XML instance
+             * need to do something different here...*/
+            assert (cb->instance == instance);
             scripts = (GList *) (long) cb->cb;
             scripts = g_list_append (scripts, tmp_content);
             g_list_free_full (matches, (GDestroyNotify) cb_release);
@@ -514,7 +539,7 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         bool ret = false;
         content = xmlNodeGetContent (node);
         DEBUG ("XML: %s: %s\n", node->name, content);
-        ret = alfred_exec (alfred->ls, (char *) content, 0);
+        ret = alfred_exec (instance, (char *) content, 0);
         if (!ret)
         {
             res = false;
@@ -538,7 +563,7 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         }
         if (path)
         {
-            cb = cb_create (&alfred->refreshers, "", (const char *) path, 0,
+            cb = cb_create (&alfred->refreshers, instance, "", (const char *) path, 0,
                             (uint64_t) (long) tmp_content);
         }
     }
@@ -559,7 +584,7 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         }
         if (path)
         {
-            cb = cb_create (&alfred->provides, "", (const char *) path, 0,
+            cb = cb_create (&alfred->provides, instance, "", (const char *) path, 0,
                             (uint64_t) (long) tmp_content);
         }
     }
@@ -580,14 +605,14 @@ process_node (alfred_instance alfred, xmlNode *node, char *parent)
         }
         if (path)
         {
-            cb = cb_create (&alfred->indexes, "", (const char *) path, 0,
+            cb = cb_create (&alfred->indexes, instance, "", (const char *) path, 0,
                             (uint64_t) (long) tmp_content);
         }
     }
     /* Process children */
     for (xmlNode *n = node->children; n; n = n->next)
     {
-        if (!process_node (alfred, n, path))
+        if (!process_node (alfred, instance, n, path))
         {
             res = false;
             goto exit;
@@ -689,6 +714,8 @@ load_config_files (alfred_instance alfred, const char *path)
     }
     rewinddir (dir);
 
+    lua_State *instance = alfred_new_instance ("xml-default");
+
     /* Load all XML files */
     for (entry = readdir (dir); entry; entry = readdir (dir))
     {
@@ -699,7 +726,7 @@ load_config_files (alfred_instance alfred, const char *path)
             char *filename = g_strdup_printf ("%s%s%s", path,
                 path[strlen (path) - 1] == '/' ? "" : "/", entry->d_name);
 
-            DEBUG ("ALFRED: Parse XML file \"%s\"\n", filename);
+            DEBUG ("ALFRED: Parse XML file \"%s\" into instance \"xml-default\"\n", filename);
             /* Parse the file */
             xmlDoc *doc = xmlParseFile (filename);
             if (doc == NULL)
@@ -709,7 +736,7 @@ load_config_files (alfred_instance alfred, const char *path)
                 res = false;
                 goto exit;
             }
-            res = process_node (alfred, xmlDocGetRootElement (doc), NULL);
+            res = process_node (alfred, instance, xmlDocGetRootElement (doc), NULL);
             xmlFreeDoc (doc);
 
             /* Stop processing files if there has been an error */
@@ -724,6 +751,9 @@ load_config_files (alfred_instance alfred, const char *path)
     }
 
   exit:
+    /* Set the LUA instance running... */
+    lua_apteryx_instance_unlock (instance);
+
     closedir (dir);
     return res;
 }
@@ -734,6 +764,12 @@ load_script_files (alfred_instance alfred, const char *path)
     struct dirent *entry;
     DIR *dir;
     bool res = true;
+
+    /* Mostly squashing a compiler warning - this is the default. */
+    if (path == NULL)
+    {
+         path = "/usr/share/alfred";
+    }
 
     /* Find all the LUA files in this folder */
     dir = opendir (path);
@@ -750,36 +786,37 @@ load_script_files (alfred_instance alfred, const char *path)
         const char *ext = strrchr (entry->d_name, '.');
         if (ext && strcmp (".lua", ext) == 0)
         {
-            char *filename = g_strdup_printf ("%s/%s", path, entry->d_name);
+            char *filename = g_strdup_printf ("%s%s", path, entry->d_name);
             int error;
+            lua_State *instance = alfred_new_instance (filename);
 
             DEBUG ("ALFRED: Load Lua file \"%s\"\n", filename);
 
             /* Execute the script */
-            lua_getglobal (alfred->ls, "debug");
-            lua_getfield (alfred->ls, -1, "traceback");
-            error = luaL_loadfile (alfred->ls, filename);
+            lua_getglobal (instance, "debug");
+            lua_getfield (instance, -1, "traceback");
+            error = luaL_loadfile (instance, filename);
             if (error == 0)
-                error = lua_pcall (alfred->ls, 0, 0, 0);
+                error = lua_pcall (instance, 0, 0, 0);
             if (error != 0)
-                alfred_error (alfred->ls, error);
+                alfred_error (instance, error);
 
-            while (lua_gettop (alfred->ls))
-                lua_pop (alfred->ls, 1);
+            while (lua_gettop (instance))
+                lua_pop (instance, 1);
+
+            /* Set the LUA instance running... */
+            lua_apteryx_instance_unlock (instance);
 
             /* Stop processing files if there has been an error */
             if (error != 0)
             {
                 CRITICAL ("ALFRED: Invalid file \"%s\"\n", filename);
-                g_free (filename);
                 res = false;
-                goto exit;
             }
             g_free (filename);
         }
     }
 
-  exit:
     closedir (dir);
     return res;
 }
@@ -789,13 +826,14 @@ struct delayed_work_s {
     guint id;
     int call;
     char *script;
+    lua_State *instance;
 };
 
 static void
 dw_destroy (gpointer arg1)
 {
     struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
-    luaL_unref (alfred_inst->ls, LUA_REGISTRYINDEX, dw->call);
+    luaL_unref (dw->instance, LUA_REGISTRYINDEX, dw->call);
     dw->call = LUA_NOREF;
     g_free (dw->script);
     g_free (dw);
@@ -809,16 +847,24 @@ delayed_work_process (gpointer arg1)
     /* Remove the script to be run */
     delayed_work = g_list_remove (delayed_work, dw);
 
-    if (dw->script)
+    if (lua_apteryx_instance_lock (dw->instance))
     {
-        /* Execute the script */
-        alfred_exec (alfred_inst->ls, dw->script, 0);
+        if (dw->script)
+        {
+            /* Execute the script */
+            alfred_exec (dw->instance, dw->script, 0);
+        }
+        else
+        {
+            lua_rawgeti (dw->instance, LUA_REGISTRYINDEX, dw->call);
+            alfred_call (dw->instance, 0);
+            lua_pop (dw->instance, 0);
+        }
+        lua_apteryx_instance_unlock (dw->instance);
     }
     else
     {
-        lua_rawgeti (alfred_inst->ls, LUA_REGISTRYINDEX, dw->call);
-        alfred_call (alfred_inst->ls, 0);
-        lua_pop (alfred_inst->ls, 0);
+        DEBUG ("Delayed work executed after instance shutdown");
     }
 
     return false;
@@ -846,9 +892,10 @@ delayed_work_add (lua_State *ls, bool reset_timer)
         dw = (struct delayed_work_s *) iter->data;
         if (script)
         {
-            found = dw->script && strcmp (script, dw->script) == 0;
+            found = dw->instance == ls && dw->script && strcmp (script, dw->script) == 0;
         }
         else if (lua_isfunction (ls, 2)
+                 && dw->instance == ls
                  && dw->call != LUA_NOREF && dw->call != LUA_REFNIL)
         {
             size_t len;
@@ -886,6 +933,7 @@ delayed_work_add (lua_State *ls, bool reset_timer)
     {
         struct delayed_work_s *dw = (struct delayed_work_s *) g_malloc0 (sizeof (struct delayed_work_s));
 
+        dw->instance = ls;
         if (script)
         {
             dw->script = g_strdup (script);
@@ -956,6 +1004,82 @@ after_quiet (lua_State *ls)
     return 0;
 }
 
+
+static lua_State *
+alfred_new_instance (const char *key)
+{
+    /* Initialise the  Lua state */
+    lua_State *instance = luaL_newstate ();
+    if (!instance)
+    {
+        CRITICAL ("ALFRED: Failed to instantiate Lua interpreter\n");
+        goto error;
+    }
+
+    /* We may need to access this instance - this occurs during tests and
+     * when choosing an instance to load a XML / LUA file into.
+     */
+    g_hash_table_insert (lua_instances, g_string_new(key), instance);
+
+    /* Load required libraries */
+    luaL_openlibs (instance);
+    if (luaopen_apteryx (instance))
+    {
+        /* Provide global access to the Apteryx library */
+        lua_setglobal (instance, "apteryx");
+    }
+
+    /* The Apteryx LUA code now has a lock held on this instance - no
+     * callbacks will be executed and the stack is protected until we
+     * call lua_apteryx_instance_unlock / apteryx_process.
+     */
+
+    /* Load the apteryx-xml API if available
+       api = require("apteryx.xml").api("/etc/apteryx/schema/")
+     */
+    if (luaL_dostring (instance, "require('api')") != 0)
+    {
+        ERROR ("ALFRED: Failed to require('api')\n");
+    }
+
+    /* Add the rate_limit,after_quiet functions to a Lua table so it can be called using Lua */
+    lua_newtable (instance);
+    lua_pushcfunction (instance, rate_limit);
+    lua_setfield (instance, -2, "rate_limit");
+    lua_pushcfunction (instance, after_quiet);
+    lua_setfield (instance, -2, "after_quiet");
+    lua_setglobal (instance, "Alfred");
+error:
+    return instance;
+}
+
+static lua_State *
+alfred_get_instance (const char *key)
+{
+    GString *needle = g_string_new (key);
+    lua_State *s = g_hash_table_lookup (lua_instances, needle);
+    g_string_free (needle, TRUE);
+    return s;
+}
+
+static void
+alfred_release_key (GString *key)
+{
+    g_string_free(key, TRUE);
+}
+
+static void
+alfred_destroy_instance(lua_State *state)
+{
+    /* TODO: Cancel all delayed work.
+     * Currently it will expire safely, but could be cancelled.
+     */
+    lua_apteryx_instance_lock (state);
+    lua_apteryx_close (state);
+    lua_close (state);
+    return;
+}
+
 static void
 alfred_shutdown (void)
 {
@@ -993,11 +1117,14 @@ alfred_shutdown (void)
         g_list_free (alfred_inst->indexes);
     }
 
-    if (alfred_inst->ls)
-        lua_close (alfred_inst->ls);
-
     if (alfred_inst->map_hash_table)
         g_hash_table_destroy (alfred_inst->map_hash_table);
+
+    if (lua_instances)
+    {
+        g_hash_table_destroy (lua_instances);
+        lua_instances = NULL;
+    }
 
     g_free (alfred_inst);
     alfred_inst = NULL;
@@ -1015,42 +1142,24 @@ alfred_init (const char *config_dir, const char *script_dir)
         goto error;
     }
 
-    /* Initialise the Lua state */
-    alfred_inst->ls = luaL_newstate ();
-    if (!alfred_inst->ls)
+    /* This table is used in the main thread to discover the lua instance for a given module. */
+    if (lua_instances == NULL)
     {
-        CRITICAL ("ALFRED: Failed to instantiate Lua interpreter\n");
-        goto error;
+        lua_instances = g_hash_table_new_full((GHashFunc)g_string_hash,
+                                              (GEqualFunc)g_string_equal,
+                                              (GDestroyNotify)alfred_release_key,
+                                              (GDestroyNotify)alfred_destroy_instance);
     }
-
-    /* Load required libraries */
-    luaL_openlibs (alfred_inst->ls);
-    if (luaopen_apteryx (alfred_inst->ls))
-    {
-        /* Provide global access to the Apteryx library */
-        lua_setglobal (alfred_inst->ls, "apteryx");
-    }
-
-    /* Load the apteryx-xml API if available
-       api = require("apteryx.xml").api("/etc/apteryx/schema/")
-     */
-    if (luaL_dostring (alfred_inst->ls, "require('api')") != 0)
-    {
-        ERROR ("ALFRED: Failed to require('api')\n");
-    }
-
-    /* Add the rate_limit,after_quiet functions to a Lua table so it can be called using Lua */
-    lua_newtable (alfred_inst->ls);
-    lua_pushcfunction (alfred_inst->ls, rate_limit);
-    lua_setfield (alfred_inst->ls, -2, "rate_limit");
-    lua_pushcfunction (alfred_inst->ls, after_quiet);
-    lua_setfield (alfred_inst->ls, -2, "after_quiet");
-    lua_setglobal (alfred_inst->ls, "Alfred");
 
     /* Load alfred lua scripts first */
-    if (script_dir && !load_script_files (alfred_inst, script_dir))
+    if (script_dir == NULL)
     {
         goto error;
+    }
+    else
+    {
+        /* We will load all possible scripts and log errors for those that fail. */
+        load_script_files (alfred_inst, script_dir);
     }
 
     /* Load schema with alfred tags second */
@@ -1110,6 +1219,7 @@ test_simple_watch ()
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')\n"
                    "  function test_node_change(new_value)\n"
                    "    test_library_function(new_value)\n"
                    "  end\n"
@@ -1124,8 +1234,9 @@ test_simple_watch ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance("xml-default");
     if (alfred_inst)
     {
         /* Trigger Action */
@@ -1133,12 +1244,12 @@ test_simple_watch ()
         sleep (1);
 
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
         {
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+            test_str = strdup (lua_tostring (instance, -1));
         }
-        lua_pop (alfred_inst->ls, 1);
+        lua_pop (instance, 1);
 
         g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
         apteryx_set ("/test/set_node", NULL);
@@ -1195,6 +1306,7 @@ test_ns_watch ()
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\"\n"
                    "  model=\"testing-2\" organization=\"Test 2 Ltd\" version=\"2023-02-01\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')\n"
                    "  function test_node_change(new_value)\n"
                    "    test_library_function(new_value)\n"
                    "  end\n"
@@ -1209,8 +1321,9 @@ test_ns_watch ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("xml-default");
     if (alfred_inst)
     {
         /* Trigger Action */
@@ -1218,12 +1331,12 @@ test_ns_watch ()
         sleep (1);
 
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
         {
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+            test_str = strdup (lua_tostring (instance, -1));
         }
-        lua_pop (alfred_inst->ls, 1);
+        lua_pop (instance, 1);
 
         g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
         apteryx_set ("/t2:test/set_node", NULL);
@@ -1262,8 +1375,9 @@ test_native_watch ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("/dev/null", "./");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("./alfred_test.lua");
     if (alfred_inst)
     {
         /* Trigger Action */
@@ -1271,12 +1385,12 @@ test_native_watch ()
         sleep (1);
 
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
         {
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+            test_str = strdup (lua_tostring (instance, -1));
         }
-        lua_pop (alfred_inst->ls, 1);
+        lua_pop (instance, 1);
         g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
         apteryx_set ("/test/set_node", NULL);
     }
@@ -1322,6 +1436,7 @@ test_dir_watch ()
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')\n"
                    "  function test_dir_change(path, new_value)\n"
                    "    test_library_function(path, new_value)\n"
                    "  end\n"
@@ -1338,8 +1453,9 @@ test_dir_watch ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("xml-default");
     if (alfred_inst)
     {
         /* Trigger Action */
@@ -1347,14 +1463,14 @@ test_dir_watch ()
         sleep (1);
 
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-        lua_pop (alfred_inst->ls, 1);
-        lua_getglobal (alfred_inst->ls, "test_path");
-        if (!lua_isnil (alfred_inst->ls, -1))
-            test_path = strdup (lua_tostring (alfred_inst->ls, -1));
-        lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
+            test_str = strdup (lua_tostring (instance, -1));
+        lua_pop (instance, 1);
+        lua_getglobal (instance, "test_path");
+        if (!lua_isnil (instance, -1))
+            test_path = strdup (lua_tostring (instance, -1));
+        lua_pop (instance, 1);
 
         g_assert (test_path && strcmp (test_path, "/test/set_node") == 0);
         g_assert (test_str && strcmp (test_str, "Goodnight cow jumping over the moon") == 0);
@@ -1366,15 +1482,15 @@ test_dir_watch ()
         sleep (1);
 
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
-        lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
+            test_str = strdup (lua_tostring (instance, -1));
+        lua_pop (instance, 1);
 
-        lua_getglobal (alfred_inst->ls, "test_path");
-        if (!lua_isnil (alfred_inst->ls, -1))
-            test_path = strdup (lua_tostring (alfred_inst->ls, -1));
-        lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (instance, "test_path");
+        if (!lua_isnil (instance, -1))
+            test_path = strdup (lua_tostring (instance, -1));
+        lua_pop (instance, 1);
 
         g_assert (test_path && strcmp (test_path, "/test/deeper/set_node") == 0);
         g_assert (test_str && strcmp (test_str, "Goodnight bears") == 0);
@@ -1424,6 +1540,7 @@ test_simple_provide ()
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')"
                    "  function test_provide(path)\n"
                    "    return test_library_function(path)\n"
                    "  end\n"
@@ -1438,7 +1555,7 @@ test_simple_provide ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1481,7 +1598,7 @@ test_native_provide ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("/dev/null", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1537,7 +1654,7 @@ test_simple_refresh ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1622,7 +1739,7 @@ test_ns_refresh ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1686,7 +1803,7 @@ test_native_refresh ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("/dev/null", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1749,6 +1866,7 @@ test_simple_index ()
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')\n"
                    "  function test_index(path)\n"
                    "    return test_library_function()\n"
                    "  end\n"
@@ -1764,7 +1882,7 @@ test_simple_index ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1817,7 +1935,7 @@ test_native_index ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("/dev/null", "./");
     g_assert (alfred_inst != NULL);
     if (alfred_inst)
     {
@@ -1846,6 +1964,146 @@ test_native_index ()
         g_list_free_full (paths, free);
     }
 }
+
+/* This test can be used with massif to check for per-instance memory allocations. */
+void
+test_native_memory ()
+{
+    FILE *library = NULL;
+    GList *paths = NULL;
+    int i;
+    char *test_str = NULL;
+
+    /* Create 1000 library files only */
+    for (i = 0; i < 1000; i++)
+    {
+        char *path = g_strdup_printf ("alfred_test_%d.lua", i);
+        library = fopen (path, "w");
+        g_assert (library != NULL);
+        if (library)
+        {
+        fprintf (library,
+                "function test_node_change(path,value)\n"
+                "  test_value = value\n"
+                "  apteryx.unwatch('/test/set_node', test_node_change)\n"
+                "end\n"
+                "apteryx.watch('/test/set_node', test_node_change)\n"
+                );
+            fclose (library);
+        }
+        free (path);
+    }
+
+    /* Init */
+    alfred_init ("/dev/null", "./");
+    g_assert (alfred_inst != NULL);
+    /* Check a random one from in the middle */
+    lua_State *instance = alfred_get_instance ("./alfred_test_50.lua");
+    if (instance)
+    {
+        /* Trigger Action */
+        apteryx_set ("/test/set_node", "Goodnight moon");
+        sleep (1);
+
+        /* Check output */
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
+        {
+            test_str = strdup (lua_tostring (instance, -1));
+        }
+        lua_pop (instance, 1);
+        g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
+        apteryx_set ("/test/set_node", NULL);
+        g_free (test_str);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+        alfred_inst = NULL;
+    }
+    for (i = 0; i < 1000; i++)
+    {
+        char *path = g_strdup_printf ("alfred_test_%d.lua", i);
+        unlink (path);
+        free (path);
+    }
+    if (paths)
+    {
+        g_list_free_full (paths, free);
+    }
+}
+
+
+void
+test_native_threading ()
+{
+    FILE *library = NULL;
+    GList *paths = NULL;
+    char *test_str = NULL;
+
+    /* Create library files only */
+
+    char *path = g_strdup_printf ("alfred_test.lua");
+    library = fopen (path, "w");
+    g_assert (library != NULL);
+    if (library)
+    {
+        fprintf (library,
+            "count = 0\n"
+            "function test_node_change(path,value)\n"
+            "  test_value = value\n"
+            "  count = count + 1\n"
+            "  if count == 2 then\n"
+            "      apteryx.unwatch('/test/set_node', test_node_change)\n"
+            "  end\n"
+            "end\n"
+            "apteryx.watch('/test/set_node', test_node_change)\n"
+            "apteryx.set('/test/set_node', 'boom there it is')\n"
+            );
+        fclose (library);
+    }
+
+    /* Init */
+    alfred_init ("/dev/null", "./");
+    g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("./alfred_test.lua");
+    if (alfred_inst)
+    {
+        /* Trigger Action */
+        sleep (1);
+        apteryx_set ("/test/set_node", "Goodnight moon");
+        sleep (1);
+
+        /* Check output */
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
+        {
+            test_str = strdup (lua_tostring (instance, -1));
+        }
+        lua_pop (instance, 1);
+        g_assert (test_str && strcmp (test_str, "Goodnight moon") == 0);
+        apteryx_set ("/test/set_node", NULL);
+        g_free (test_str);
+    }
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+        unlink ("./alfred_test.lua");
+        alfred_inst = NULL;
+    }
+
+    unlink (path);
+    g_free (path);
+    if (paths)
+    {
+        g_list_free_full (paths, free);
+    }
+}
+
 
 /* Glib unit test */
 void
@@ -1882,6 +2140,7 @@ test_rate_limit ()
                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                    "  <SCRIPT>\n"
+                   "  require('alfred_test')\n"
                    "  function test_node_change(new_value)\n"
                    "    test_library_function(new_value)\n"
                    "  end\n"
@@ -1896,8 +2155,9 @@ test_rate_limit ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("xml-default");
     if (alfred_inst)
     {
         /* Trigger Action */
@@ -1911,16 +2171,16 @@ test_rate_limit ()
 
         sleep (1);
         /* Check output */
-        lua_getglobal (alfred_inst->ls, "test_value");
-        if (!lua_isnil (alfred_inst->ls, -1))
+        lua_getglobal (instance, "test_value");
+        if (!lua_isnil (instance, -1))
         {
-            test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+            test_str = strdup (lua_tostring (instance, -1));
         }
-        lua_pop (alfred_inst->ls, 1);
+        lua_pop (instance, 1);
 
-        lua_getglobal (alfred_inst->ls, "count");
-        test_count = lua_tointeger(alfred_inst->ls, -1);
-        lua_pop (alfred_inst->ls, 1);
+        lua_getglobal (instance, "count");
+        test_count = lua_tointeger (instance, -1);
+        lua_pop (instance, 1);
 
         g_assert (test_str && strcmp (test_str, "Goodnight scoot") == 0);
         g_assert (test_count < 50);
@@ -1977,6 +2237,7 @@ test_after_quiet ()
                     "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
                     "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
                     "  <SCRIPT>\n"
+                    "  require('alfred_test')\n"
                     "  function test_node_change(new_value)\n"
                     "    test_library_function(new_value)\n"
                     "  end\n"
@@ -2000,8 +2261,9 @@ test_after_quiet ()
     }
 
     /* Init */
-    alfred_init ("./", "./");
+    alfred_init ("./", "/dev/null");
     g_assert (alfred_inst != NULL);
+    lua_State *instance = alfred_get_instance ("xml-default");
     if (alfred_inst)
     {
         char *test_str = NULL;
@@ -2032,25 +2294,25 @@ test_after_quiet ()
 
             sleep (1);
             /* Check output */
-            lua_getglobal (alfred_inst->ls, "test_value");
-            if (!lua_isnil (alfred_inst->ls, -1))
+            lua_getglobal (instance, "test_value");
+            if (!lua_isnil (instance, -1))
             {
-                test_str = strdup (lua_tostring (alfred_inst->ls, -1));
+                test_str = strdup (lua_tostring (instance, -1));
             }
-            lua_pop (alfred_inst->ls, 1);
+            lua_pop (instance, 1);
 
-            lua_getglobal (alfred_inst->ls, "count");
-            test_count = lua_tointeger(alfred_inst->ls, -1);
-            lua_pop (alfred_inst->ls, 1);
+            lua_getglobal (instance, "count");
+            test_count = lua_tointeger (instance, -1);
+            lua_pop (instance, 1);
 
             g_assert (test_str && strcmp (test_str, tests[i].check) == 0);
             g_assert (test_count == 1);
 
             /* Reset Lua variables */
-            lua_pushnil(alfred_inst->ls);
-            lua_setglobal(alfred_inst->ls, "test_value");
-            lua_pushinteger (alfred_inst->ls, (lua_Integer)0);
-            lua_setglobal(alfred_inst->ls, "count");
+            lua_pushnil (instance);
+            lua_setglobal (instance, "test_value");
+            lua_pushinteger (instance, (lua_Integer)0);
+            lua_setglobal (instance, "count");
 
             apteryx_set (tests[i].node, NULL);
             free (test_str);
@@ -2067,20 +2329,126 @@ test_after_quiet ()
     unlink ("alfred_test.xml");
 }
 
-static gboolean
-process_apteryx (GIOChannel *source, GIOCondition condition, gpointer data)
+
+/* Glib unit test */
+void
+test_intermodule_interaction ()
 {
-    assert (alfred_inst);
-    luaL_loadstring (alfred_inst->ls, "apteryx.process()");
-    int res = lua_pcall (alfred_inst->ls, 0, 0, 0);
-    if (res != 0)
-        alfred_error (alfred_inst->ls, res);
-    uint8_t dummy = 0;
-    if (read (alfred_apteryx_fd, &dummy, 1) == 0)
+    FILE *library = NULL;
+    FILE *data = NULL;
+    char *test_str = NULL;
+
+    apteryx_init (false);
+    /* Create library file + XML */
+    library = fopen ("alfred_test.lua", "w");
+    g_assert (library != NULL);
+    if (library)
     {
-        ERROR ("Poll/Read error: %s\n", strerror (errno));
+        fprintf (library,
+                 "function test_watched_node(test_str)\n"
+                 "  apteryx.unwatch('/test/watched_node', test_watched_node)\n"
+                 "  test_value = test_str\n"
+                 "end\n"
+                 "function test_provided_node(test_str)\n"
+                 "  apteryx.unprovide('/test/provided_node', test_provided_node)\n"
+                 "  return \"provided value\"\n"
+                 "end\n"
+                 "function test_refreshed_node(path)\n"
+                 "  apteryx.set(path, \"refreshed value\")\n"
+                 "  apteryx.unrefresh('/test/refreshed_node', test_refreshed_node)\n"
+                 "  return 100000\n"
+                 "end\n"
+                 "apteryx.watch('/test/watched_node', test_watched_node)\n"
+                 "apteryx.refresh('/test/refreshed_node', test_refreshed_node)\n"
+                 "apteryx.provide('/test/provided_node', test_provided_node)\n"
+                 );
+        fclose (library);
     }
-    return true;
+
+    data = fopen ("alfred_test.xml", "w");
+    g_assert (data != NULL);
+    if (data)
+    {
+        fprintf (data, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                    "<MODULE xmlns=\"https://github.com/alliedtelesis/apteryx\"\n"
+                    "  xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+                    "  xsi:schemaLocation=\"https://github.com/alliedtelesis/apteryx\n"
+                    "  https://github.com/alliedtelesis/apteryx/releases/download/v2.10/apteryx.xsd\">\n"
+                    "  <SCRIPT>\n"
+                    "  function test_node_change(new_value)\n"
+                    "    test_value = new_value\n"
+                    // "    apteryx.unwatch('/test/watched_node', test_node_change)\n"
+                    "  end\n"
+                    "  function refresh_node(_path)\n"
+                    "      apteryx.set(_path, apteryx.get(\"/test/refreshed_node\"))\n"
+                    "      return 100000\n"
+                    "  end\n"
+                    "  </SCRIPT>\n"
+                    "  <NODE name=\"test\">\n"
+                    "    <NODE name=\"xml_provide\" mode=\"r\">\n"
+                    "      <PROVIDE>return apteryx.get(\"/test/provided_node\")</PROVIDE>\n"
+                    "    </NODE>\n"
+                    "    <NODE name=\"watched_node\" mode=\"rw\">\n"
+                    "      <WATCH>test_node_change(_value)</WATCH>\n"
+                    "    </NODE>\n"
+                    "    <NODE name=\"xml_refreshed_node\" mode=\"r\">\n"
+                    "      <REFRESH>refresh_node(_path)</REFRESH>\n"
+                    "    </NODE>\n"
+                    "  </NODE>\n"
+                    "</MODULE>\n");
+        fclose (data);
+    }
+
+    /* Init */
+    alfred_init ("./", "./");
+    g_assert (alfred_inst != NULL);
+    lua_State *xml_instance = alfred_get_instance ("xml-default");
+    lua_State *native_instance = alfred_get_instance ("./alfred_test.lua");
+
+    apteryx_set ("/test/watched_node","watched_value");
+    sleep (1);
+
+    /* Check watches */
+    /* XML watcher */
+    lua_getglobal (xml_instance, "test_value");
+    if (!lua_isnil (xml_instance, -1))
+    {
+        test_str = strdup (lua_tostring (xml_instance, -1));
+    }
+    lua_pop (xml_instance, 1);
+    g_assert (test_str && strcmp(test_str, "test_value"));
+    free (test_str);
+    test_str = NULL;
+
+    /* LUA watcher */
+    lua_getglobal (native_instance, "test_value");
+    if (!lua_isnil (native_instance, -1))
+    {
+        test_str = strdup (lua_tostring (native_instance, -1));
+    }
+    lua_pop (native_instance, 1);
+    g_assert (test_str && strcmp(test_str, "test_value"));
+    free (test_str);
+    test_str = NULL;
+
+    /* This provider requires a provide out of native module */
+    test_str = apteryx_get ("/test/xml_provide");
+    g_assert (test_str && strcmp ("provided value", test_str) == 0);
+    free (test_str);
+
+    /* This provider requires a refresh out of native module */
+    test_str = apteryx_get ("/test/xml_refreshed_node");
+    g_assert (test_str && strcmp ("refreshed value", test_str) == 0);
+    free (test_str);
+    apteryx_prune ("/test");
+
+    /* Clean up */
+    if (alfred_inst)
+    {
+        alfred_shutdown ();
+    }
+    unlink ("alfred_test.lua");
+    unlink ("alfred_test.xml");
 }
 
 static gboolean
@@ -2165,9 +2533,9 @@ main (int argc, char *argv[])
 
     /* Initialise Apteryx client library in single threaded mode */
     apteryx_init (apteryx_debug);
-    alfred_apteryx_fd = apteryx_process (true);
-    g_io_add_watch (g_io_channel_unix_new (alfred_apteryx_fd),
-                    G_IO_IN, process_apteryx, NULL);
+    // alfred_apteryx_fd = apteryx_process (true);
+    // g_io_add_watch (g_io_channel_unix_new (alfred_apteryx_fd),
+    //                 G_IO_IN, process_apteryx, NULL);
 
     cb_init ();
 
@@ -2193,6 +2561,9 @@ main (int argc, char *argv[])
         g_test_add_func ("/test_native_index", test_native_index);
         g_test_add_func ("/test_rate_limit", test_rate_limit);
         g_test_add_func ("/test_after_quiet", test_after_quiet);
+        g_test_add_func ("/test_native_memory", test_native_memory);
+        g_test_add_func ("/test_native_threading", test_native_threading);
+        g_test_add_func ("/test_intermodule_interaction", test_intermodule_interaction);
 
         loop = g_main_loop_new (NULL, true);
         g_unix_signal_add (SIGINT, termination_handler, loop);

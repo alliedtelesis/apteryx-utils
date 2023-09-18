@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <syslog.h>
 #include <glib.h>
+#include <lua.h>
 
 /* Default UNIX socket path */
 #define APTERYX_SERVER  "unix:///tmp/apteryx"
@@ -117,7 +118,7 @@ static inline uint32_t htol32 (uint32_t v)
 typedef struct _cb_info_t
 {
     bool active;
-
+    lua_State *instance;
     const char *guid;
     const char *path;
     const char *uri;
@@ -129,7 +130,7 @@ typedef struct _cb_info_t
     uint32_t count;
 } cb_info_t;
 void cb_init (void);
-cb_info_t * cb_create (GList **list, const char *guid, const char *path, uint64_t id, uint64_t callback);
+cb_info_t * cb_create (GList **list, lua_State *instance, const char *guid, const char *path, uint64_t id, uint64_t callback);
 void cb_destroy (cb_info_t *cb);
 void cb_release (cb_info_t *cb);
 GList *cb_match (GList **list, const char *path, int critera);
