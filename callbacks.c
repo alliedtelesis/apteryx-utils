@@ -27,11 +27,12 @@ GList *proxy_list = NULL;
 static pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
 
 cb_info_t *
-cb_create (GList **list, const char *guid, const char *path,
+cb_create (GList **list, lua_State *instance, const char *guid, const char *path,
         uint64_t id, uint64_t callback)
 {
     cb_info_t *cb = (cb_info_t *) g_malloc0 (sizeof (cb_info_t));
     cb->active = true;
+    cb->instance = instance;
     cb->guid = g_strdup (guid);
     cb->path = g_strdup (path);
     cb->id = id;
