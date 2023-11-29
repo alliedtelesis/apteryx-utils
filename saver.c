@@ -279,7 +279,14 @@ write_config_process (gpointer arg1)
             apteryx_free_tree (config_nodes);
         config_nodes = apteryx_query (saver_nodes);
     }
-    _write_config ();
+    if (config_nodes)
+    {
+        _write_config ();
+    }
+    else
+    {
+        ERROR("Failed to fetch config to write");
+    }
     pthread_mutex_unlock (&config_lock);
     return G_SOURCE_CONTINUE;
 }
