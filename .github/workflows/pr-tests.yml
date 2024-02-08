@@ -30,4 +30,4 @@ jobs:
     - name: Build
       run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=./apteryx-xml make
     - name: Run tests
-      run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=./apteryx-xml make test
+      run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=./apteryx-xml TEST_WRAPPER="G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full" make test
