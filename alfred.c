@@ -2114,7 +2114,6 @@ test_rate_limit ()
     char *test_str = NULL;
     lua_Integer test_count;
 
-    apteryx_init (false);
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
@@ -2205,7 +2204,6 @@ test_after_quiet ()
     FILE *library = NULL;
     FILE *data = NULL;
 
-    apteryx_init (false);
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
@@ -2338,7 +2336,6 @@ test_intermodule_interaction ()
     FILE *data = NULL;
     char *test_str = NULL;
 
-    apteryx_init (false);
     /* Create library file + XML */
     library = fopen ("alfred_test.lua", "w");
     g_assert (library != NULL);
@@ -2541,11 +2538,7 @@ main (int argc, char *argv[])
 
     if (unit_test)
     {
-        pthread_t main_thread;
-        pthread_attr_t attr;
-
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        GThread *main_thread;
 
         g_test_init (&argc, &argv, NULL);
         g_test_add_func ("/test_simple_watch", test_simple_watch);
@@ -2566,13 +2559,10 @@ main (int argc, char *argv[])
         g_test_add_func ("/test_intermodule_interaction", test_intermodule_interaction);
 
         loop = g_main_loop_new (NULL, true);
-        g_unix_signal_add (SIGINT, termination_handler, loop);
-        g_unix_signal_add (SIGTERM, termination_handler, loop);
-        pthread_create (&main_thread, &attr, (void *) g_main_loop_run, loop);
-        pthread_join(main_thread, NULL);
+        main_thread = g_thread_new ("main_loop", (GThreadFunc) g_main_loop_run, loop);
         g_test_run();
-        pthread_cancel(main_thread);
-        pthread_attr_destroy(&attr);
+        g_main_loop_quit (loop);
+        g_thread_join (main_thread);
         goto exit;
     }
     else
