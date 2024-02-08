@@ -27,7 +27,9 @@ jobs:
         path: apteryx-xml
     - name: Build apteryx-xml
       run: APTERYX_PATH=../apteryx make -C ./apteryx-xml
-    - name: Build
+    - name: Build apteryx-utils
       run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=./apteryx-xml make
-    - name: Run tests
-      run: APTERYX_PATH=./apteryx APTERYX_XML_PATH=./apteryx-xml TEST_WRAPPER="G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full" make test
+    - name: Run apteryxd
+      run: LD_LIBRARY_PATH=./apteryx ./apteryx/apteryxd -b
+    - name: Run Alfred unit tests
+      run: LD_LIBRARY_PATH=./apteryx:./apteryx-xml:. G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full alfred -u
