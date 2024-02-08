@@ -32,4 +32,4 @@ jobs:
     - name: Run apteryxd
       run: LD_LIBRARY_PATH=./apteryx ./apteryx/apteryxd -b
     - name: Run Alfred unit tests
-      run: LD_LIBRARY_PATH=./apteryx:./apteryx-xml:. G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full alfred -u
+      run: LD_LIBRARY_PATH=./apteryx:./apteryx-xml:. G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full ./alfred -u
