@@ -66,7 +66,7 @@ int luaopen_apteryx (lua_State *L);
 int lua_apteryx_close (lua_State *L);
 bool lua_apteryx_instance_lock (lua_State *L);
 void lua_apteryx_instance_unlock (lua_State *L);
-static lua_State *alfred_new_instance(const char *key);
+static lua_State *alfred_new_instance(const char *key, bool api_required);
 
 static void
 alfred_error (lua_State *ls, int res)
@@ -714,7 +714,7 @@ load_config_files (alfred_instance alfred, const char *path)
     }
     rewinddir (dir);
 
-    lua_State *instance = alfred_new_instance ("xml-default");
+    lua_State *instance = alfred_new_instance ("xml-default", true);
 
     /* Load all XML files */
     for (entry = readdir (dir); entry; entry = readdir (dir))
@@ -788,7 +788,7 @@ load_script_files (alfred_instance alfred, const char *path)
         {
             char *filename = g_strdup_printf ("%s%s", path, entry->d_name);
             int error;
-            lua_State *instance = alfred_new_instance (filename);
+            lua_State *instance = alfred_new_instance (filename, false);
 
             DEBUG ("ALFRED: Load Lua file \"%s\"\n", filename);
 
@@ -1006,7 +1006,7 @@ after_quiet (lua_State *ls)
 
 
 static lua_State *
-alfred_new_instance (const char *key)
+alfred_new_instance (const char *key, bool api_required)
 {
     /* Initialise the  Lua state */
     lua_State *instance = luaL_newstate ();
@@ -1037,7 +1037,7 @@ alfred_new_instance (const char *key)
     /* Load the apteryx-xml API if available
        api = require("apteryx.xml").api("/etc/apteryx/schema/")
      */
-    if (luaL_dostring (instance, "require('api')") != 0)
+    if (api_required && luaL_dostring (instance, "require('api')") != 0)
     {
         ERROR ("ALFRED: Failed to require('api')\n");
     }
