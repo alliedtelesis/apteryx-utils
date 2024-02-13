@@ -657,23 +657,9 @@ sch_load_namespace_mappings (alfred_instance instance, const char *filename)
             ns_names = g_strsplit (buf, " ", 2);
             if (ns_names[0] && ns_names[1])
             {
-                void *old_key;
-                void *old_value;
-
-                /* Look up this node name to check for duplicates. */
-                if (g_hash_table_lookup_extended (instance->map_hash_table, ns_names[0],
-                                                  &old_key, &old_value))
-                {
-                    g_hash_table_insert (instance->map_hash_table, g_strdup (ns_names[0]),
-                                         g_strdup (ns_names[1]));
-                    g_free (old_key);
-                    g_free (old_value);
-                }
-                else
-                {
-                    g_hash_table_insert (instance->map_hash_table, g_strdup (ns_names[0]),
-                                         g_strdup (ns_names[1]));
-                }
+                /* Insert will take care of duplicates automatically. */
+                g_hash_table_insert (instance->map_hash_table, g_strdup (ns_names[0]),
+                                     g_strdup (ns_names[1]));
             }
             g_strfreev (ns_names);
         }
