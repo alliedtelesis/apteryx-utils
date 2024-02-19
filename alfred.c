@@ -819,7 +819,9 @@ static void
 dw_destroy (gpointer arg1)
 {
     struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
+    lua_apteryx_instance_lock (dw->instance);
     luaL_unref (dw->instance, LUA_REGISTRYINDEX, dw->call);
+    lua_apteryx_instance_unlock (dw->instance);
     dw->call = LUA_NOREF;
     g_free (dw->script);
     g_free (dw);
@@ -911,7 +913,13 @@ delayed_work_add (lua_State *ls, bool reset_timer)
         if (found && reset_timer)
         {
             delayed_work = g_list_remove (delayed_work, dw);
+            /* When destroying the old delayed work object we access the
+             * lua_State under the lock, so it must be released here.
+             */
+            lua_State *instance = dw->instance;
+            lua_apteryx_instance_unlock (instance);
             g_source_remove (dw->id);
+            lua_apteryx_instance_lock (instance);
         }
     }
 
