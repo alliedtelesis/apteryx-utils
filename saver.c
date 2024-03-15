@@ -332,29 +332,39 @@ load_config ()
     data = fopen (config_file, "r");
     if (!data)
     {
+        ERROR ("Could not find config file %s\n", config_file);
         return;
     }
     root = g_node_new (strdup("/"));
 
     while ((count = getline (&line, &len, data)) != -1)
     {
-        /* Remove trailing newline */
-        line[count-1] = '\0';
-        char *path = g_strdup (line);
-        if (strncmp (path, "/", 1) != 0)
+        /* Old format ^path\t(value)\n */
+        size_t tabs = 0;
+        for (int i=0; line[i]; i++)
+            tabs += (line[i] == '\t');
+        if (tabs == 1)
         {
-            g_free (path);
-            continue;
+            char *tab = strchr (line, '\t');
+            char *path = line;
+            char *value = tab + 1; 
+            *tab = '\0';
+            if (value[strlen (value) - 1] == '\n')
+                value[strlen (value) - 1] = '\0';
+            _path_to_node (root, path, value);
         }
-        char *value = NULL;
-
-        if (strchr (path, '\t'))
+        /* New format ^path(<ws>(")value("))\n */
+        else
         {
-            *strchr (path, '\t') = '\0';
-            value = strchr (line, '\t') + 1;
+            char path[4096], value[4096];
+            value[0] = '\0';
+            if (sscanf (line, "%4095s \"%[^\"]\"", path, value) == 2 ||
+                sscanf (line, "%4095s %4095[^\n]", path, value) == 2 ||
+                sscanf (line, "%4095s", path) == 1)
+            {
+                _path_to_node (root, path, value);
+            }
         }
-        _path_to_node (root, path, value);
-        g_free (path);
     }
     apteryx_set_tree (root);
 
@@ -591,6 +601,7 @@ help (char *app_name)
             "  -h   show this help\n"
             "  -b   background mode\n"
             "  -d   enable verbose debug\n"
+            "  -e   exit immediately after loading and applying config file\n"
             "  -p   use <pidfile> (defaults to " APTERYX_SAVE_PID ")\n"
             "  -s   use <schemadir> to search for schemas (defaults to " APTERYX_SCHEMA_DIR ")\n"
             "  -c   use <configdir> to search for config files (defaults to " APTERYX_CONFIG_DIR ")\n"
@@ -612,13 +623,14 @@ main (int argc, char *argv[])
     bool unit_test = false;
     bool background = false;
     bool load_startup_config = false;
+    bool load_only = false;
     int w = 0;
     int i = 0;
 
     apteryx_init (false);
 
     /* Parse options */
-    while ((i = getopt (argc, argv, "hdbp:s:c:uaw:f:l")) != -1)
+    while ((i = getopt (argc, argv, "hdbep:s:c:uaw:f:l")) != -1)
     {
         switch (i)
         {
@@ -629,6 +641,9 @@ main (int argc, char *argv[])
             break;
         case 'b':
             background = true;
+            break;
+        case 'e':
+            load_only = true;
             break;
         case 'p':
             pid_file = optarg;
@@ -669,6 +684,13 @@ main (int argc, char *argv[])
             help (argv[0]);
             return 0;
         }
+    }
+
+    /* Load config and exit */
+    if (load_only)
+    {
+        load_config ();
+        goto exit;
     }
 
     /* Daemonize */
