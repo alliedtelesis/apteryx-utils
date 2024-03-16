@@ -511,9 +511,8 @@ test_write_config ()
     APTERYX_LEAF (iroot, strdup ("ifname"),strdup ( "eth0"));
     APTERYX_LEAF (iroot, strdup ("proto"), strdup ("static"));
 
-    write_config (i);
+    _write_config ();
 
-    sleep (1);
     const char *paths[3] = {"/test/junk/hello/5/proto", "/test/junk/hello/5/ifname", "/test/junk/hello/5/prefix"};
     const char *values[3] = {"static", "eth0", "10.0.0.0/8"};
     data = fopen (config_file, "r");
@@ -558,7 +557,15 @@ test_load_config ()
 
     fprintf (data, "/test/junk/hello/6/proto\tstatic\n"
                    "/test/junk/hello/6/ifname\teth1\n"
-                   "/test/junk/hello/6/prefix\t11.0.0.0/8\n");
+                   "/test/junk/hello/6/prefix\t11.0.0.0/8\n"
+                   "/test/junk/hello/6/old\t     static   \n"
+                   "/test/junk/hello/6/new  \"     static   \"\n"
+                   "/test/ani_mal/mouse\t\t\t\t\tdoggy bat\n"
+                   "/test/ani_mal/bat     doggy    barney  \n"
+                   "/test/car/bmw  \"this is a bmw\"\n"
+                   "/test/car/jeep\t\n"
+                   "/test/car/nissan \n"
+                   );
     fclose (data);
     data = NULL;
 
@@ -573,8 +580,26 @@ test_load_config ()
     val = apteryx_get ("/test/junk/hello/6/prefix");
     g_assert (val && strcmp (val, "11.0.0.0/8") == 0);
     g_free (val);
+    val = apteryx_get ("/test/junk/hello/6/old");
+    g_assert (val && strcmp (val, "     static   ") == 0);
+    g_free (val);
+    val = apteryx_get ("/test/junk/hello/6/new");
+    g_assert (val && strcmp (val, "     static   ") == 0);
+    g_free (val);
+    val = apteryx_get ("/test/ani_mal/mouse");
+    g_assert (val && strcmp (val, "doggy bat") == 0);
+    g_free (val);
+    val = apteryx_get ("/test/ani_mal/bat");
+    g_assert (val && strcmp (val, "doggy    barney  ") == 0);
+    g_free (val);
+    val = apteryx_get ("/test/car/bmw");
+    g_assert (val && strcmp (val, "this is a bmw") == 0);
+    g_free (val);
+    g_assert (apteryx_get ("/test/car/jeep") == NULL);
+    g_assert (apteryx_get ("/test/car/nissan") == NULL);
 
     apteryx_free_tree (config_nodes);
+    apteryx_prune ("/test");
     config_nodes = NULL;
 }
 
@@ -707,6 +732,8 @@ main (int argc, char *argv[])
 
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+        config_file = "./saver_test.cfg";
 
         g_test_init (&argc, &argv, NULL);
         g_test_add_func ("/test_xml_to_nodes_basic", test_xml_to_nodes_basic);
