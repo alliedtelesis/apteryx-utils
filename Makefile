@@ -69,13 +69,16 @@ apteryxd = \
 	rm -f /tmp/apteryxd.pid; \
 	rm -f /tmp/apteryxd.run; \
 	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH) $(APTERYX_PATH)/apteryxd -b -p /tmp/apteryxd.pid -r /tmp/apteryxd.run && sleep 0.1; \
-	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH) $(TEST_WRAPPER) ./$(1); \
+	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH):$(APTERYX_XML_PATH) $(TEST_WRAPPER) ./$(1); \
 	kill -TERM `cat /tmp/apteryxd.pid`;
 
-test: alfred
-	@echo "Running unit test: $<"
+test: alfred apteryx-saver
+	@echo "Running unit test: alfred"
 	$(Q)$(call apteryxd,alfred -u)
 	$(Q)rm -f alfred_test.xml alfred_test.map alfred_test.lua
+	@echo "Running unit test: saver"
+	$(Q)$(call apteryxd,apteryx-saver -u)
+	$(Q)rm -f saver_test.cfg
 	@echo "Tests have been run!"
 
 install: all
