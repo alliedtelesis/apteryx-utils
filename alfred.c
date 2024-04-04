@@ -807,6 +807,7 @@ load_script_files (alfred_instance alfred, const char *path)
     return res;
 }
 
+static pthread_mutex_t delayed_work_lock = PTHREAD_MUTEX_INITIALIZER;
 GList *delayed_work = NULL;
 struct delayed_work_s {
     guint id;
@@ -833,7 +834,9 @@ delayed_work_process (gpointer arg1)
     struct delayed_work_s *dw = (struct delayed_work_s *) arg1;
 
     /* Remove the script to be run */
+    pthread_mutex_lock (&delayed_work_lock);
     delayed_work = g_list_remove (delayed_work, dw);
+    pthread_mutex_unlock (&delayed_work_lock);
 
     if (lua_apteryx_instance_lock (dw->instance))
     {
@@ -983,7 +986,9 @@ rate_limit (lua_State *ls)
 {
     if (validate_script_or_function_args (ls, "Alfred.rate_limit()"))
     {
+        pthread_mutex_lock (&delayed_work_lock);
         delayed_work_add (ls, false);
+        pthread_mutex_unlock (&delayed_work_lock);
     }
     return 0;
 }
@@ -993,7 +998,9 @@ after_quiet (lua_State *ls)
 {
     if (validate_script_or_function_args (ls, "Alfred.after_quiet()"))
     {
+        pthread_mutex_lock (&delayed_work_lock);//aa
         delayed_work_add (ls, true);
+        pthread_mutex_unlock (&delayed_work_lock);
     }
     return 0;
 }
