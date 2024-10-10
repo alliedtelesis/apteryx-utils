@@ -126,6 +126,10 @@ All files in this directory are read in.
 ```
 /path/to/sync/*
 ```
+* Any path that will work with the CLI "apterxy -q path" can be used. e.g.
+```
+/path/to/sync/*/specific/information
+```
 * To exclude a particular node in a synced path, add it as a new line preceded by an '!'. e.g.
 ```
 !/path/to/sync/excluded_node
