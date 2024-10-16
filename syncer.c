@@ -344,7 +344,7 @@ sync_tree_process (GNode *node, gpointer arg)
             ts = apteryx_timestamp (path);
             if (ts && ts > params->ts)
             {
-                APTERYX_LEAF (params->root, strdup (path), (char *) node->data);
+                APTERYX_LEAF (params->root, strdup (path + 1), (char *) node->data);
                 node->data = NULL;
             }
         }
