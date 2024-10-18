@@ -55,7 +55,6 @@ static guint sync_timer = 0;
 
 /* keep a list of the paths we are syncing */
 GList *paths = NULL;
-GList *excluded_paths = NULL;
 pthread_rwlock_t paths_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static uint64_t
@@ -329,18 +328,13 @@ sync_tree_process (GNode *node, gpointer arg)
 {
     uint64_t ts;
     sync_params *params = (sync_params *) arg;
-    char *path = apteryx_node_path (node);
+    char *path = apteryx_node_path (node->parent);
 
     if (path)
     {
         if (!sync_path_excluded (params->entry, path))
         {
             /* The timestamp is stored on the parent of the value. */
-            char *ptr = strrchr (path, '/');
-            if (ptr)
-            {
-                *ptr = '\0';
-            }
             ts = apteryx_timestamp (path);
             if (ts && ts > params->ts)
             {
@@ -520,17 +514,11 @@ sync_find_sync_entry (GNode *node)
 static gboolean
 new_change_process (GNode *node, gpointer arg)
 {
-    char *path = apteryx_node_path (node);
+    char *path = apteryx_node_path (node->parent);
     char *value = NULL;
     sync_entry *entry = (sync_entry *) arg;
     if (path)
     {
-        char *ptr = strrchr (path, '/');
-        if (ptr)
-        {
-            *ptr = '\0';
-        }
-
         if (!sync_path_excluded (entry, path))
         {
             if (node->data && ((char *) node->data)[0] != '\0')
