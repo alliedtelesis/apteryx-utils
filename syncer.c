@@ -339,7 +339,6 @@ sync_tree_process (GNode *node, gpointer arg)
             if (ts && ts > params->ts)
             {
                 apteryx_path_to_node (params->root, path, node->data ?: "");
-                node->data = NULL;
             }
         }
         g_free (path);
