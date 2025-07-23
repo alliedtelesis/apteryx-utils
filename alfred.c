@@ -714,7 +714,11 @@ load_config_files (alfred_instance alfred, const char *path)
 
             DEBUG ("ALFRED: Parse XML file \"%s\" into instance \"xml-default\"\n", filename);
             /* Parse the file */
+#if LIBXML_VERSION >= 21400
+            xmlDoc *doc = xmlReadFile (filename, NULL, XML_PARSE_UNZIP);
+#else   /* LibXML < 2.14.0 */
             xmlDoc *doc = xmlParseFile (filename);
+#endif  /* LIBXML_VERSION */
             if (doc == NULL)
             {
                 CRITICAL ("ALFRED: Invalid file \"%s\"\n", filename);
