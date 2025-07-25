@@ -1,0 +1,18 @@
+{
+   ignore_apteryx_callback_subthread
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@GLIBC_2.34
+   obj:/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.8000.0
+   fun:g_thread_new
+   fun:g_thread_pool_new_full
+   fun:request_cb
+   fun:listen_thread
+   fun:start_thread
+   fun:clone
+}
