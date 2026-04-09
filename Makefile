@@ -1,8 +1,8 @@
 # Makefile for Apteryx
 #
 # Unit Tests (make test FILTER): e.g make test Alfred
-# Requires GLib, Lua and libXML2.
-# sudo apt-get install libglib2.0-dev liblua5.2-dev libxml2-dev libcunit1-dev
+# Requires GLib, Lua, Jansson and libXML2.
+# sudo apt-get install libglib2.0-dev liblua5.2-dev libxml2-dev libcunit1-dev libjansson-dev
 #
 # TEST_WRAPPER="G_SLICE=always-malloc valgrind --leak-check=full" make test
 # TEST_WRAPPER="gdb --args" make test
@@ -17,8 +17,8 @@ PREFIX?=/usr/
 CC:=$(CROSS_COMPILE)gcc
 LD:=$(CROSS_COMPILE)ld
 PKG_CONFIG ?= pkg-config
-APTERYX_PATH ?=
-APTERYX_XML_PATH ?=
+APTERYX_PATH ?= "../apteryx"
+APTERYX_XML_PATH ?= "../apteryx-xml"
 
 CFLAGS := $(CFLAGS) -g -O2
 EXTRA_CFLAGS += -Wall -Wno-comment -std=c99 -D_GNU_SOURCE -fPIC
@@ -43,12 +43,18 @@ EXTRA_CFLAGS += -DHAVE_LUA $(shell $(PKG_CONFIG) --cflags $(LUAVERSION))
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs $(LUAVERSION)) -ldl
 EXTRA_CFLAGS += -DHAVE_LIBXML2 $(shell $(PKG_CONFIG) --cflags libxml-2.0)
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs libxml-2.0)
+EXTRA_CFLAGS += -DHAVE_LIBJANSSON $(shell $(PKG_CONFIG) --cflags jansson)
+EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs jansson)
 
-all: alfred apteryx-sync apteryx-saver
+all: alfred apteryx-sync apteryx-saver recorder
 
 %.o: %.c
 	@echo "Compiling "$<""
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
+
+recorder: recorder.o
+	@echo "Building $@"
+	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $^ $(EXTRA_LDFLAGS)
 
 apteryx-saver: saver.o
 	@echo "Building $@"
@@ -72,6 +78,8 @@ apteryxd = \
 	LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):./:$(APTERYX_PATH):$(APTERYX_XML_PATH) $(TEST_WRAPPER) ./$(1); \
 	kill -TERM `cat /tmp/apteryxd.pid`;
 
+
+# Nothing added for recorder yet....
 test: alfred apteryx-saver
 	@echo "Running unit test: alfred"
 	$(Q)$(call apteryxd,alfred -u)
@@ -83,6 +91,7 @@ test: alfred apteryx-saver
 
 install: all
 	@install -d $(DESTDIR)/$(PREFIX)/bin
+	@install -D recorder $(DESTDIR)/$(PREFIX)/bin/
 	@install -D apteryx-sync $(DESTDIR)/$(PREFIX)/bin/
 	@install -D alfred $(DESTDIR)/$(PREFIX)/bin/
 	@install -D apteryx-saver $(DESTDIR)/$(PREFIX)/bin/
@@ -91,6 +100,6 @@ install: all
 
 clean:
 	@echo "Cleaning..."
-	$(Q)rm -f apteryx-sync alfred saver *.o
+	$(Q)rm -f apteryx-sync alfred saver recorder *.o
 
 .PHONY: all clean
