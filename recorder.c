@@ -22,6 +22,17 @@ static const int json_indent = 2;
 
 static void compare_json_deep(json_t *old_json, json_t *new_json, 
                                const char *path_prefix, json_t *changes);
+
+typedef struct _config_data
+{
+    char *query;
+    long frequency;
+    char *destination;
+    int max_samples;
+    long max_size;
+    GMainLoop *loop;
+} config_data;
+                       
 // FIXME: Make errors & general style consistent with other ATL/ Apteryx... e.g. error codes...
 
 // FIXME: Replace w/ json_load_file?
@@ -103,23 +114,15 @@ json_t *gnode_to_json(const GNode *node)
     return obj;
 }
 
-static int make_dir(const char *path)
+static int make_path(const char *path)
 {
-    if (mkdir(path, 0600) == -1)
-    {
-        if (errno == EEXIST)
-        {
-            printf("Directory already exists.\n");
-        }
-        else
-        {
-            perror("mkdir failed");
-        }
+    char *p = path + (*path == '/');  // Skip leading /
+    while ((p = strchr(p, '/'))) {
+        *p = '\0';
+        if (mkdir(path, 0755) && errno != EEXIST) return 0;
+        *p++ = '/';
     }
-    else
-    {
-        printf("Directory created successfully.\n");
-    }
+    return 1;
 }
 
 
@@ -161,10 +164,7 @@ static void compare_objects(json_t *old_obj, json_t *new_obj,
     json_object_foreach(old_obj, key, value)
     {
         char new_path[path_buffer];
-        build_path(new_path, sizeof(new_path), path_prefix, key);
-        
-        printf("My KEY is: %s", key);
-        
+        build_path(new_path, sizeof(new_path), path_prefix, key);        
         json_t *new_value = json_object_get(new_obj, key);
         compare_json_deep(value, new_value, new_path, changes);
     }
@@ -255,7 +255,7 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
     {
 
         // attempt to make the path before creating the JSON
-        if(!make_dir(path_to_diff)) return 0;
+        if(!make_path(path_to_diff)) return 0;
 
         json_t *new_storage = json_object();
         json_object_set_new(new_storage, "current", json_deep_copy(current_json));
@@ -295,6 +295,53 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
     if (error_code != 0) return 0;
     
     return 1;
+}
+
+
+static gboolean polling_callback(gpointer user_data) {
+    config_data *config = (config_data *)user_data;
+
+    GNode *tree = apteryx_query (g_node_new (config->query));
+        
+    json_t *json_from_tree = tree ? gnode_to_json(tree) : NULL;
+    apteryx_free_tree (tree);
+
+    if (!json_from_tree) {
+        fprintf(stderr, "error: could not fetch JSON from query: %s\n", config->query);
+        return G_SOURCE_CONTINUE; // Should it terminate the thread/loop?
+    }
+    
+    if (write_diff(json_from_tree, config->destination) != 1)
+    {
+        fprintf(stderr, "error: could not write diff. Check destination: %s\n", config->destination);
+        json_decref(json_from_tree);
+        return G_SOURCE_REMOVE;
+    }    
+    
+    json_decref(json_from_tree);
+    
+    return G_SOURCE_CONTINUE;
+}
+
+static gpointer thread_func(gpointer user_data) {
+    config_data *config = (config_data *)user_data;
+    
+    GMainContext *context = g_main_context_new();
+    config->loop = g_main_loop_new(context, FALSE);
+
+    g_main_context_push_thread_default(context);
+    
+    GSource *timeout = g_timeout_source_new_seconds(config->frequency);
+    g_source_set_callback(timeout, polling_callback, config, NULL);
+    g_source_attach(timeout, context);
+    g_source_unref(timeout);
+    
+    g_main_loop_run(config->loop);
+    
+    g_main_context_pop_thread_default(context);
+    g_main_context_unref(context);
+    
+    return NULL;
 }
 
 
@@ -357,6 +404,8 @@ int main(int argc, char *argv[])
     // FIXME: Put into separate functionS
     for(i = 0; i < json_array_size(root); i++)
     {
+        // TODO: Verify data. e.g. unique dest(?), limits on freq/max values
+        // What to do if an identical query is attempted? Prefer more frequent or older?
         json_t *data, *query, *frequency, *destination, *max_samples, *max_size;
         //  "query": "/test/*/tests",
         // "frequency": "30"(s),
@@ -412,35 +461,20 @@ int main(int argc, char *argv[])
             return 1;
         }
 
-        // TODO: Make a new thread for EACH config file: give it relevant config info
-        // FIXME: Put into separate function
-        char *query_text;
-        query_text = strdup(json_string_value(query));
-        
-        printf("s %s  TO %s\n",
-            query_text, 
-            json_string_value(destination)
-            );
+        config_data *config = malloc(sizeof(config_data));
+        config->query = strdup(json_string_value(query));
+        config->frequency = json_integer_value(frequency);
+        config->destination = strdup(json_string_value(destination));
+        config->max_samples = json_integer_value(max_samples);
+        config->max_size = json_integer_value(max_size);
 
-        GNode *gquery = g_node_new (query_text); 
-        GNode *tree = apteryx_query(gquery); // FIXME: Prevent segfaults from bad queries...
-        json_t *json_from_tree = gnode_to_json(tree);
-
-        if (json_from_tree)
-        {
-            if (write_diff(json_from_tree, json_string_value(destination)) != 1)
-            {
-                printf("error: could not complete diff calculation. Check destination.\n");
-                return 0;
-            }
-
-            json_decref(json_from_tree);
-            apteryx_free_tree (tree);
-        } else {
-            printf("error: could not fetch JSON from query. Is it empty?\n");
-        }
+        g_thread_new(NULL, thread_func, config);
     }
 
     json_decref(root);
+
+    GMainLoop *main_loop = g_main_loop_new(NULL, false);
+    g_main_loop_run(main_loop);
+
     return 0;
 }
