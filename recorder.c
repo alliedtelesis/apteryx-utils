@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <ctype.h>
 #include <pthread.h>
 #include <dirent.h>
 #include <apteryx.h>
@@ -298,6 +299,49 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
 }
 
 
+static char* sanitize_path_for_config(const char *path) {
+    char *result = malloc(strlen(path) + 7);
+    strcpy(result, "config-");
+    char *dst = result + 7;
+    
+    for (const char *src = path; *src; src++) {
+        if (*src == '/' || *src == '.') {
+            *dst++ = '-';
+        } else if (isalnum(*src) || *src == '_') { // Check for exceptions
+            *dst++ = *src;
+        }
+    }
+
+    *dst = '\0';
+    return result;
+}
+
+static void create_logrotate_config(config_data *config) {
+    char *config_name = sanitize_path_for_config(config->destination);
+
+    char config_path[path_buffer];
+    snprintf(config_path, path_buffer, "/etc/logrotate.d/%s", config_name);
+    
+    FILE *f = fopen(config_path, "w");
+    if (!f) {
+        fprintf(stderr, "Failed to create logrotate config: %s\n", config_path);
+        free(config_name);
+        return;
+    }
+    
+    fprintf(f, "%s {\n", config->destination); // Needs to be absolute path...
+    fprintf(f, "    size %ldM\n", config->max_size);
+    fprintf(f, "    rotate %d\n", config->max_samples);
+    fprintf(f, "    missingok\n");
+    fprintf(f, "    notifempty\n");
+    fprintf(f, "    nocreate\n");
+    fprintf(f, "}\n");
+    
+    fclose(f);
+    free(config_name);
+}
+
+
 static gboolean polling_callback(gpointer user_data) {
     config_data *config = (config_data *)user_data;
 
@@ -467,6 +511,8 @@ int main(int argc, char *argv[])
         config->destination = strdup(json_string_value(destination));
         config->max_samples = json_integer_value(max_samples);
         config->max_size = json_integer_value(max_size);
+
+        create_logrotate_config(config);
 
         g_thread_new(NULL, thread_func, config);
     }
