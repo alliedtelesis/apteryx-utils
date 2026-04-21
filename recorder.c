@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <errno.h>
 #include <time.h>
+#include <libgen.h>
 #include <jansson.h>
 #include "common.h"
 #include "apteryx_sync.h"
@@ -34,56 +35,6 @@ typedef struct _config_data
     GMainLoop *loop;
 } config_data;
                        
-// FIXME: Make errors & general style consistent with other ATL/ Apteryx... e.g. error codes...
-
-// FIXME: Replace w/ json_load_file?
-static char* load_file(const char* filename) {
-    FILE* f = fopen(filename, "r");
-    if (!f) return NULL;
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    rewind(f);
-
-    char *buffer = malloc(size + 1);
-    if (buffer)
-    {
-        long bytes_read = fread(buffer, 1, size, f);
-        if (bytes_read < size) return NULL; // File was not completely read...
-        buffer[size] = '\0';
-    }
-    fclose(f);
-    return buffer;
-}
-
-// FIXME: Function decomp
-// static int read_text(char* json_text, json_t* root) {
-//     json_error_t error;
-//     json_t *temp_root;
-
-
-//     temp_root = json_loads(json_text, 0, &error);
-//     free(json_text);
-
-
-//     if(!temp_root)
-//     {
-//         fprintf(stderr, "error: on line %d: %s\n", error.line, error.text);
-//         return 0;
-//     }
-
-//     if(!json_is_array(temp_root))
-//     {
-//         fprintf(stderr, "error: root is not an array\n");
-//         json_decref(temp_root);
-//         return 0;
-//     }
-
-//     *root = *temp_root;
-
-//     return 1;
-// }
-
 
 json_t *gnode_to_json(const GNode *node)
 {
@@ -115,21 +66,18 @@ json_t *gnode_to_json(const GNode *node)
     return obj;
 }
 
-static int make_path(const char *path)
+static int make_path(char *path)
 {
     char *p = path + (*path == '/');  // Skip leading /
     while ((p = strchr(p, '/'))) {
         *p = '\0';
-        if (mkdir(path, 0755) && errno != EEXIST) return 0;
+        if (mkdir(path, 0755) && errno != EEXIST) return -1;
         *p++ = '/';
     }
-    return 1;
+    return 0;
 }
 
 
-
-// TODO: Change dot notation to be more like actual tree... 
-// Uses dot notation for children/indices. e.g. parent.child.0
 static void build_path(char *buffer, size_t size, const char *prefix, const char *key)
 {
     if (strlen(prefix) == 0)
@@ -142,20 +90,6 @@ static void build_path(char *buffer, size_t size, const char *prefix, const char
     }
 }
 
-// FIXME(?): json foreach/set discards const....
-    // I assume its better to keep const and suppress warnings...
-
-// FIXME: Optimise option...
-    // void *iter = json_object_iter((json_t*)new_obj);
-    // while (iter) {
-    //     const char *key = json_object_iter_key(iter);
-    //     json_t *old_val = json_object_get(old_obj, key);
-    //     json_t *new_val = json_object_iter_value(iter);
-    //     // compare and mark new keys
-    //     iter = json_object_iter_next((json_t*)new_obj, iter);
-    // }
-    // // Then iterate old_obj only for removed keys
-// Compares JSON objects
 static void compare_objects(json_t *old_obj, json_t *new_obj,
                            const char *path_prefix, json_t *changes)
 {
@@ -254,10 +188,6 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
    
     if (!storage)
     {
-
-        // attempt to make the path before creating the JSON
-        if(!make_path(path_to_diff)) return 0;
-
         json_t *new_storage = json_object();
         json_object_set_new(new_storage, "current", json_deep_copy(current_json));
         
@@ -272,9 +202,7 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
         error_code = json_dump_file(new_storage, path_to_diff, JSON_INDENT(json_indent));
         json_decref(new_storage);
 
-        if (error_code != 0) return 0;
-
-        return 1;
+        return error_code;
     }
     
     json_t *old_current = json_object_get(storage, "current");
@@ -282,7 +210,7 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
     compare_json_deep(old_current, current_json, "", changes);
     
     json_t *new_diff = json_object();
-    json_object_set_new(new_diff, "timestamp", json_integer(time(NULL))); // Should timestamp be earlier?
+    json_object_set_new(new_diff, "timestamp", json_integer(time(NULL)));
     json_object_set_new(new_diff, "changes", changes);
     
     json_t *diffs_array = json_object_get(storage, "diffs");
@@ -292,14 +220,13 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
     
     error_code = json_dump_file(storage, path_to_diff, JSON_INDENT(json_indent));
     json_decref(storage);
-
-    if (error_code != 0) return 0;
     
-    return 1;
+    return error_code;
 }
 
 
-static char* sanitize_path_for_config(const char *path) {
+static char* sanitize_path_for_config(const char *path)
+{
     char *result = malloc(strlen(path) + 7);
     strcpy(result, "config-");
     char *dst = result + 7;
@@ -307,7 +234,7 @@ static char* sanitize_path_for_config(const char *path) {
     for (const char *src = path; *src; src++) {
         if (*src == '/' || *src == '.') {
             *dst++ = '-';
-        } else if (isalnum(*src) || *src == '_') { // Check for exceptions
+        } else if (isalnum(*src) || *src == '_') {
             *dst++ = *src;
         }
     }
@@ -316,20 +243,50 @@ static char* sanitize_path_for_config(const char *path) {
     return result;
 }
 
-static void create_logrotate_config(config_data *config) {
-    char *config_name = sanitize_path_for_config(config->destination);
+static char* resolve_absolute_path(const char *path)
+{
+    // If full path already exists, resolve directly
+    char *resolved = realpath(path, NULL);
+    if (resolved) return resolved;
 
+    // In the likely case there is no file, resolve parent directory instead (& append name)
+    char *path_copy = strdup(path);
+    char *resolved_dir = realpath(dirname(path_copy), NULL);
+    free(path_copy);
+
+    if (!resolved_dir) return NULL;
+
+    path_copy = strdup(path);
+    char *result = malloc(strlen(resolved_dir) + strlen(basename(path_copy)) + 2);
+    sprintf(result, "%s/%s", resolved_dir, basename(path_copy));
+
+    free(path_copy);
+    free(resolved_dir);
+    return result;
+}
+
+static void create_logrotate_config(config_data *config)
+{
+    char *absolute_path = resolve_absolute_path(config->destination);
+    if (!absolute_path)
+    {
+        fprintf(stderr, "error: failed to resolve path: %s\n", config->destination);
+        return;
+    }
+    
+    char *config_name = sanitize_path_for_config(config->destination);
     char config_path[path_buffer];
     snprintf(config_path, path_buffer, "/etc/logrotate.d/%s", config_name);
     
     FILE *f = fopen(config_path, "w");
     if (!f) {
-        fprintf(stderr, "Failed to create logrotate config: %s\n", config_path);
+        fprintf(stderr, "error: failed to create logrotate config: %s\n", config_path);
+        free(absolute_path);
         free(config_name);
         return;
     }
     
-    fprintf(f, "%s {\n", config->destination); // Needs to be absolute path...
+    fprintf(f, "%s {\n", absolute_path);
     fprintf(f, "    size %ldM\n", config->max_size);
     fprintf(f, "    rotate %d\n", config->max_samples);
     fprintf(f, "    missingok\n");
@@ -338,6 +295,7 @@ static void create_logrotate_config(config_data *config) {
     fprintf(f, "}\n");
     
     fclose(f);
+    free(absolute_path);
     free(config_name);
 }
 
@@ -352,10 +310,10 @@ static gboolean polling_callback(gpointer user_data) {
 
     if (!json_from_tree) {
         fprintf(stderr, "error: could not fetch JSON from query: %s\n", config->query);
-        return G_SOURCE_CONTINUE; // Should it terminate the thread/loop?
+        return G_SOURCE_CONTINUE;
     }
     
-    if (write_diff(json_from_tree, config->destination) != 1)
+    if (write_diff(json_from_tree, config->destination) != 0)
     {
         fprintf(stderr, "error: could not write diff. Check destination: %s\n", config->destination);
         json_decref(json_from_tree);
@@ -389,63 +347,10 @@ static gpointer thread_func(gpointer user_data) {
 }
 
 
-
-int main(int argc, char *argv[])
+static int initialise_configs(json_t *root)
 {
-    apteryx_init(false);
-
     size_t i;
-    char *text;
-    json_t *root = NULL;
 
-    if(argc != 1)
-    {
-        fprintf(stderr, "usage: %s USER REPOSITORY\n\n", argv[0]);
-        fprintf(stderr, "List commits at USER's REPOSITORY.\n\n");
-        return -1;
-    }
-
-    text = load_file("test.json");
-    if(!text) {
-        fprintf(stderr, "error: unable to open file.");
-        return 0;
-    }
-
-
-    // FIXME: Put into separate function
-    json_error_t error;
-
-    root = json_loads(text, 0, &error);
-    free(text);
-
-    if(!root)
-    {
-        fprintf(stderr, "error: on line %d: %s\n", error.line, error.text);
-        return 0;
-    }
-
-    if(!json_is_array(root))
-    {
-        fprintf(stderr, "error: root is not an array\n");
-        json_decref(root);
-        return 0;
-    }
-
-    // if (!read_text(text, root)) {
-    //     fprintf(stderr, "Error: unable to read file as JSON.");
-    //     return 0;
-    // }
-
-    if(!root){
-        fprintf(stderr, "Erdfdfror: unable to read file as JSON.");
-        return 0;
-    }
-
-    
-  
-
-
-    // FIXME: Put into separate functionS
     for(i = 0; i < json_array_size(root); i++)
     {
         // TODO: Verify data. e.g. unique dest(?), limits on freq/max values
@@ -462,7 +367,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d is not an object\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         query = json_object_get(data, "query");
@@ -470,7 +375,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d: query is not a string\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         frequency = json_object_get(data, "frequency");
@@ -478,7 +383,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d: frequency is not an integer\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         destination = json_object_get(data, "destination");
@@ -486,7 +391,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d: destination is not a string\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         max_samples = json_object_get(data, "max_samples");
@@ -494,7 +399,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d: max_samples is not an integer\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         max_size = json_object_get(data, "max_size");
@@ -502,7 +407,7 @@ int main(int argc, char *argv[])
         {
             fprintf(stderr, "error: config set %d: max_size is not an integer\n", (int)(i + 1));
             json_decref(root);
-            return 1;
+            return -1;
         }
 
         config_data *config = malloc(sizeof(config_data));
@@ -512,11 +417,50 @@ int main(int argc, char *argv[])
         config->max_samples = json_integer_value(max_samples);
         config->max_size = json_integer_value(max_size);
 
+        // attempt to make destination path before calling logrotate
+        if(make_path(config->destination) != 0)
+        {
+            fprintf(stderr, "error: failed to create specified path: %s\n", config->destination);
+            return -1;
+        }
+
         create_logrotate_config(config);
 
         g_thread_new(NULL, thread_func, config);
     }
 
+    return 0;
+}
+
+
+int main(int argc, char *argv[])
+{
+    apteryx_init(false);
+
+    json_t *root;
+    json_error_t error;
+
+    if(argc != 2)
+    {
+        fprintf(stderr, "usage: %s [PATH/TO/CONFIG.JSON]\n\n", argv[0]);
+        fprintf(stderr, "Reads config array from PATH/TO/CONFIG.JSON.\n\n");
+        return -1;
+    }
+
+    root = json_load_file(argv[1], 0, &error);
+    if(!root) {
+        fprintf(stderr, "error: unable to open file.");
+        return -1;
+    }
+
+    if(!json_is_array(root))
+    {
+        fprintf(stderr, "error: config is not an array\n");
+        json_decref(root);
+        return -1;
+    }
+
+    initialise_configs(root);
     json_decref(root);
 
     GMainLoop *main_loop = g_main_loop_new(NULL, false);
