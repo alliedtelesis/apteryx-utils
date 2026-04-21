@@ -19,11 +19,9 @@
 #include "apteryx_sync.h"
 
 static const int path_buffer = 256;
-static const int index_buffer = 32;
 static const int json_indent = 2;
 
-static void compare_json_deep(json_t *old_json, json_t *new_json, 
-                               const char *path_prefix, json_t *changes);
+static json_t *compare_json_deep(json_t *old_json, json_t *new_json);
 
 typedef struct _config_data
 {
@@ -41,11 +39,8 @@ json_t *gnode_to_json(const GNode *node)
     json_t *obj = json_object();
     if (!obj) return NULL;
 
-    for (const GNode *child = node->children;
-         child;
-         child = child->next)
+    for (const GNode *child = node->children; child; child = child->next)
     {
-
         json_t *child_json = NULL;
         if (APTERYX_HAS_VALUE(child))
         {
@@ -54,7 +49,8 @@ json_t *gnode_to_json(const GNode *node)
         else
         {
             child_json = gnode_to_json(child);
-            if (!child_json) {
+            if (!child_json)
+            {
                 json_decref(obj);
                 return NULL;
             }
@@ -69,7 +65,8 @@ json_t *gnode_to_json(const GNode *node)
 static int make_path(char *path)
 {
     char *p = path + (*path == '/');  // Skip leading /
-    while ((p = strchr(p, '/'))) {
+    while ((p = strchr(p, '/')))
+    {
         *p = '\0';
         if (mkdir(path, 0755) && errno != EEXIST) return -1;
         *p++ = '/';
@@ -78,105 +75,80 @@ static int make_path(char *path)
 }
 
 
-static void build_path(char *buffer, size_t size, const char *prefix, const char *key)
+static json_t *compare_objects(json_t *old_obj, json_t *new_obj)
 {
-    if (strlen(prefix) == 0)
-    {
-        snprintf(buffer, size, "%s", key);
-    }
-    else
-    {
-        snprintf(buffer, size, "%s.%s", prefix, key);
-    }
-}
-
-static void compare_objects(json_t *old_obj, json_t *new_obj,
-                           const char *path_prefix, json_t *changes)
-{
+    json_t *changes = json_object();
     const char *key;
     json_t *value;
     
     json_object_foreach(old_obj, key, value)
     {
-        char new_path[path_buffer];
-        build_path(new_path, sizeof(new_path), path_prefix, key);        
-        json_t *new_value = json_object_get(new_obj, key);
-        compare_json_deep(value, new_value, new_path, changes);
+        json_t *diff = compare_json_deep(value, json_object_get(new_obj, key));
+        if (diff) json_object_set_new(changes, key, diff);
     }
     
-    // This is needed to find NEW keys (thus causing NULLs in the diff)
     json_object_foreach(new_obj, key, value)
     {
         if (!json_object_get(old_obj, key))
         {
-            char new_path[path_buffer];
-            build_path(new_path, sizeof(new_path), path_prefix, key);
-            json_object_set_new(changes, new_path, json_null());
+            json_object_set_new(changes, key, json_null());
         }
     }
+
+    if (!json_object_size(changes))
+    {
+        json_decref(changes);
+        return NULL;
+    }
+    return changes;
 }
 
-static void compare_arrays(const json_t *old_arr, const json_t *new_arr,
-                          const char *path_prefix, json_t *changes)
+static json_t *compare_arrays(const json_t *old_arr, const json_t *new_arr)
 {
     size_t old_size = json_array_size(old_arr);
     size_t new_size = json_array_size(new_arr);
     size_t max_size = old_size > new_size ? old_size : new_size;
+
+    json_t *changes = json_array();
+    gboolean has_changes = FALSE;
     
     for (size_t i = 0; i < max_size; i++)
-    {
-        char index_str[index_buffer];
-        snprintf(index_str, sizeof(index_str), "%zu", i);
-        
-        char new_path[path_buffer];
-        build_path(new_path, sizeof(new_path), path_prefix, index_str);
-        
+    {       
         json_t *old_elem = i < old_size ? json_array_get(old_arr, i) : json_null();
         json_t *new_elem = i < new_size ? json_array_get(new_arr, i) : json_null();
-        
-        compare_json_deep(old_elem, new_elem, new_path, changes);
+        json_t *diff = compare_json_deep(old_elem, new_elem);
+
+        // Always append to maintain index alignment
+        json_array_append_new(changes, diff ? diff : json_null());
+        if (diff) has_changes = TRUE;
     }
+
+    if (!has_changes)
+    {
+        json_decref(changes);
+        return NULL;
+    }
+    return changes;
 }
 
 // Compares objects based on their type
-static void compare_json_deep(json_t *old_json, json_t *new_json, 
-                               const char *path_prefix, json_t *changes)
+static json_t *compare_json_deep(json_t *old_json, json_t *new_json)
 {
-    if (!old_json && !new_json) return;
-    
-    if (!old_json && new_json)
-    {
-        json_object_set_new(changes, path_prefix, json_null());
-        return;
-    }
-    
-    if (old_json && !new_json)
-    {
-        json_object_set(changes, path_prefix, old_json);
-        return;
-    }
+    if (!old_json && !new_json) return NULL;
+    if (!old_json) return json_null();
+    if (!new_json) return json_incref(old_json);
     
     // Cant easily compare different types
     if (json_typeof(old_json) != json_typeof(new_json))
     {
-        json_object_set(changes, path_prefix, old_json);
-        return;
+        return json_incref(old_json);
     }
     
     switch (json_typeof(old_json))
     {
-        case JSON_OBJECT:
-            compare_objects(old_json, new_json, path_prefix, changes);
-            break;
-        case JSON_ARRAY:
-            compare_arrays(old_json, new_json, path_prefix, changes);
-            break;
-        default: // E.g. string / num / bool
-            if (!json_equal(old_json, new_json))
-            {
-                json_object_set(changes, path_prefix, old_json);
-            }
-            break;
+        case JSON_OBJECT: return compare_objects(old_json, new_json);
+        case JSON_ARRAY: return compare_arrays(old_json, new_json);
+        default: return json_equal(old_json, new_json) ? NULL : json_incref(old_json);
     }
 }
 
@@ -185,18 +157,18 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
     int error_code;
     json_error_t error;
     json_t *storage = json_load_file(path_to_diff, 0, &error);
+    json_t *diff = json_object();
    
     if (!storage)
     {
         json_t *new_storage = json_object();
         json_object_set_new(new_storage, "current", json_deep_copy(current_json));
         
-        json_t *diffs_array = json_array();
-        json_t *initial_diff = json_object();
-        json_object_set_new(initial_diff, "timestamp", json_integer(time(NULL)));
-        json_object_set_new(initial_diff, "changes", json_object());
-        json_array_append_new(diffs_array, initial_diff);
+        json_object_set_new(diff, "timestamp", json_integer(time(NULL)));
+        json_object_set_new(diff, "changes", json_object());
         
+        json_t *diffs_array = json_array();
+        json_array_append_new(diffs_array, diff);
         json_object_set_new(new_storage, "diffs", diffs_array);
         
         error_code = json_dump_file(new_storage, path_to_diff, JSON_INDENT(json_indent));
@@ -205,17 +177,12 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
         return error_code;
     }
     
-    json_t *old_current = json_object_get(storage, "current");
-    json_t *changes = json_object();
-    compare_json_deep(old_current, current_json, "", changes);
+    json_t *changes = compare_json_deep(json_object_get(storage, "current"), current_json);
     
-    json_t *new_diff = json_object();
-    json_object_set_new(new_diff, "timestamp", json_integer(time(NULL)));
-    json_object_set_new(new_diff, "changes", changes);
+    json_object_set_new(diff, "timestamp", json_integer(time(NULL)));
+    json_object_set_new(diff, "changes", changes ? changes : json_object());
     
-    json_t *diffs_array = json_object_get(storage, "diffs");
-    json_array_append_new(diffs_array, new_diff);
-    
+    json_array_append_new(json_object_get(storage, "diffs"), diff);
     json_object_set_new(storage, "current", json_deep_copy(current_json));
     
     error_code = json_dump_file(storage, path_to_diff, JSON_INDENT(json_indent));
@@ -225,16 +192,21 @@ static int write_diff(json_t *current_json, const char* path_to_diff)
 }
 
 
+// Creates a unique name for logrotate conf based on destination
 static char* sanitize_path_for_config(const char *path)
 {
     char *result = malloc(strlen(path) + 7);
     strcpy(result, "config-");
     char *dst = result + 7;
     
-    for (const char *src = path; *src; src++) {
-        if (*src == '/' || *src == '.') {
+    for (const char *src = path; *src; src++)
+    {
+        if (*src == '/' || *src == '.')
+        {
             *dst++ = '-';
-        } else if (isalnum(*src) || *src == '_') {
+        } 
+        else if (isalnum(*src) || *src == '_') 
+        {
             *dst++ = *src;
         }
     }
@@ -249,7 +221,7 @@ static char* resolve_absolute_path(const char *path)
     char *resolved = realpath(path, NULL);
     if (resolved) return resolved;
 
-    // In the likely case there is no file, resolve parent directory instead (& append name)
+    // If there is no file, resolve parent directory instead (& append name)
     char *path_copy = strdup(path);
     char *resolved_dir = realpath(dirname(path_copy), NULL);
     free(path_copy);
@@ -279,7 +251,8 @@ static void create_logrotate_config(config_data *config)
     snprintf(config_path, path_buffer, "/etc/logrotate.d/%s", config_name);
     
     FILE *f = fopen(config_path, "w");
-    if (!f) {
+    if (!f)
+    {
         fprintf(stderr, "error: failed to create logrotate config: %s\n", config_path);
         free(absolute_path);
         free(config_name);
@@ -300,7 +273,8 @@ static void create_logrotate_config(config_data *config)
 }
 
 
-static gboolean polling_callback(gpointer user_data) {
+static gboolean polling_callback(gpointer user_data)
+{
     config_data *config = (config_data *)user_data;
 
     GNode *tree = apteryx_query (g_node_new (config->query));
@@ -308,7 +282,8 @@ static gboolean polling_callback(gpointer user_data) {
     json_t *json_from_tree = tree ? gnode_to_json(tree) : NULL;
     apteryx_free_tree (tree);
 
-    if (!json_from_tree) {
+    if (!json_from_tree)
+    {
         fprintf(stderr, "error: could not fetch JSON from query: %s\n", config->query);
         return G_SOURCE_CONTINUE;
     }
@@ -325,7 +300,8 @@ static gboolean polling_callback(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
-static gpointer thread_func(gpointer user_data) {
+static gpointer thread_func(gpointer user_data)
+{
     config_data *config = (config_data *)user_data;
     
     GMainContext *context = g_main_context_new();
@@ -442,14 +418,15 @@ int main(int argc, char *argv[])
 
     if(argc != 2)
     {
-        fprintf(stderr, "usage: %s [PATH/TO/CONFIG.JSON]\n\n", argv[0]);
-        fprintf(stderr, "Reads config array from PATH/TO/CONFIG.JSON.\n\n");
+        fprintf(stderr, "usage: %s [PATH/TO/CONFIG.JSON]\n", argv[0]);
+        fprintf(stderr, "Reads config array from PATH/TO/CONFIG.JSON.\n");
         return -1;
     }
 
     root = json_load_file(argv[1], 0, &error);
-    if(!root) {
-        fprintf(stderr, "error: unable to open file.");
+    if(!root)
+    {
+        fprintf(stderr, "error: unable to open file: %s\n", argv[1]);
         return -1;
     }
 
