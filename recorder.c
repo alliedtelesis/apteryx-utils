@@ -167,7 +167,8 @@ write_diff (json_t *current_json, const char *path_to_diff)
     json_t *changes =
         compare_json_deep (json_object_get (storage, "current"), current_json);
 
-    json_object_set_new (diff, "timestamp", json_deep_copy (json_object_get (storage, "timestamp")));
+    json_object_set_new (diff, "timestamp",
+                         json_deep_copy (json_object_get (storage, "timestamp")));
     json_object_set_new (diff, "changes", changes ? changes : json_object ());
 
     json_array_append_new (json_object_get (storage, "diffs"), diff);
@@ -328,13 +329,99 @@ thread_func (gpointer user_data)
 
 
 static int
+validate_destination (json_t *destination, char **destination_array, size_t *dest_count)
+{
+    char *dest_str = strdup (json_string_value (destination));
+
+    if (make_path (dest_str) != 0)
+    {
+        fprintf (stderr, "error: failed to create specified path: %s\n", dest_str);
+        return -1;
+    }
+
+    char *abs_path = resolve_absolute_path (dest_str);
+
+    for (size_t i = 0; i < *dest_count; i++)
+    {
+        if (strcmp (destination_array[i], abs_path) == 0)
+        {
+            fprintf (stderr, "error: destination specified in earlier config: %s\n",
+                     abs_path);
+            free (abs_path);
+            return -1;
+        }
+    }
+
+    destination_array[(*dest_count)++] = abs_path;
+    return 0;
+}
+
+static int
+validate_data (json_t *data, config_data *config, char **destination_array,
+               size_t *dest_count)
+{
+    json_t *query, *frequency, *destination, *max_samples, *max_size;
+
+    query = json_object_get (data, "query");
+    if (!json_is_string (query))
+    {
+        fprintf (stderr, "error: query is not a string\n");
+        return -1;
+    }
+
+    frequency = json_object_get (data, "frequency");
+    if (!json_is_integer (frequency))
+    {
+        fprintf (stderr, "error: frequency is not an integer\n");
+        return -1;
+    }
+
+    destination = json_object_get (data, "destination");
+    if (!json_is_string (destination))
+    {
+        fprintf (stderr, "error: destination is not a string\n");
+        return -1;
+    }
+
+    // if destionation already exists (or cant be made), gracefully reject.
+    if (validate_destination (destination, destination_array, dest_count) != 0)
+    {
+        return 1;
+    }
+
+    max_samples = json_object_get (data, "max_samples");
+    if (!json_is_integer (max_samples))
+    {
+        fprintf (stderr, "error: max_samples is not an integer\n");
+        return -1;
+    }
+
+    max_size = json_object_get (data, "max_size");
+    if (!json_is_integer (max_size))
+    {
+        fprintf (stderr, "error: max_size is not an integer\n");
+        return -1;
+    }
+
+    config->query = strdup (json_string_value (query));
+    config->frequency = json_integer_value (frequency);
+    config->destination = strdup (json_string_value (destination));
+    config->max_samples = json_integer_value (max_samples);
+    config->max_size = json_integer_value (max_size);
+
+    return 0;
+}
+
+static int
 initialise_configs (json_t *root)
 {
     size_t i;
+    char **destination_array = malloc (json_array_size (root) * sizeof (char *));
+    size_t dest_count = 0;
 
     for (i = 0; i < json_array_size (root); i++)
     {
-        json_t *data, *query, *frequency, *destination, *max_samples, *max_size;
+        json_t *data;
 
         data = json_array_get (root, i);
         if (!json_is_object (data))
@@ -344,70 +431,31 @@ initialise_configs (json_t *root)
             return -1;
         }
 
-        query = json_object_get (data, "query");
-        if (!json_is_string (query))
-        {
-            fprintf (stderr, "error: config set %d: query is not a string\n",
-                     (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
-
-        frequency = json_object_get (data, "frequency");
-        if (!json_is_integer (frequency))
-        {
-            fprintf (stderr, "error: config set %d: frequency is not an integer\n",
-                     (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
-
-        destination = json_object_get (data, "destination");
-        if (!json_is_string (destination))
-        {
-            fprintf (stderr, "error: config set %d: destination is not a string\n",
-                     (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
-
-        max_samples = json_object_get (data, "max_samples");
-        if (!json_is_integer (max_samples))
-        {
-            fprintf (stderr, "error: config set %d: max_samples is not an integer\n",
-                     (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
-
-        max_size = json_object_get (data, "max_size");
-        if (!json_is_integer (max_size))
-        {
-            fprintf (stderr, "error: config set %d: max_size is not an integer\n",
-                     (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
-
         config_data *config = malloc (sizeof (config_data));
-        config->query = strdup (json_string_value (query));
-        config->frequency = json_integer_value (frequency);
-        config->destination = strdup (json_string_value (destination));
-        config->max_samples = json_integer_value (max_samples);
-        config->max_size = json_integer_value (max_size);
-
-        // attempt to make destination path before calling logrotate
-        if (make_path (config->destination) != 0)
+        int result = validate_data (data, config, destination_array, &dest_count);
+        if (result == -1)
         {
-            fprintf (stderr, "error: failed to create specified path: %s\n",
-                     config->destination);
+            fprintf (stderr, "error: bad value in config set %d \n", (int) (i + 1));
+            json_decref (root);
+            free (config);
             return -1;
+        }
+        if (result == 1)
+        {
+            fprintf (stderr, "error: skipping config set %d \n", (int) (i + 1));
+            continue;
         }
 
         create_logrotate_config (config);
 
         g_thread_new (NULL, thread_func, config);
     }
+
+    for (size_t i = 0; i < dest_count; i++)
+    {
+        free (destination_array[i]);
+    }
+    free (destination_array);
 
     return 0;
 }
