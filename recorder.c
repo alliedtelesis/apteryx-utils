@@ -155,7 +155,6 @@ write_diff (json_t *current_json, const char *path_to_diff)
         json_object_set_new (new_storage, "current", json_deep_copy (current_json));
 
         json_t *diffs_array = json_array ();
-        json_array_append_new (diffs_array, diff);
         json_object_set_new (new_storage, "diffs", diffs_array);
 
         error_code = json_dump_file (new_storage, path_to_diff, JSON_INDENT (json_indent));
@@ -171,7 +170,7 @@ write_diff (json_t *current_json, const char *path_to_diff)
                          json_deep_copy (json_object_get (storage, "timestamp")));
     json_object_set_new (diff, "changes", changes ? changes : json_object ());
 
-    json_array_append_new (json_object_get (storage, "diffs"), diff);
+    json_array_insert_new (json_object_get (storage, "diffs"), 0, diff);
     json_object_set_new (storage, "timestamp", json_integer (time (NULL)));
     json_object_set_new (storage, "current", json_deep_copy (current_json));
 
