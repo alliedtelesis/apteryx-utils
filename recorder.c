@@ -1,22 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <ctype.h>
-#include <pthread.h>
-#include <dirent.h>
 #include <apteryx.h>
 #include <glib-unix.h>
-#include <apteryx-xml.h>
-#include <syslog.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <errno.h>
 #include <time.h>
+#include <getopt.h>
+#include <dirent.h>
 #include <libgen.h>
 #include <jansson.h>
-#include "common.h"
-#include "apteryx_sync.h"
+#include <CUnit/CUnit.h>
+#include <CUnit/Basic.h>
 
 static const int path_buffer = 256;
 static const int json_indent = 2;
@@ -328,36 +324,21 @@ thread_func (gpointer user_data)
 
 
 static int
-validate_destination (json_t *destination, char **destination_array, size_t *dest_count)
+validate_destination (json_t *destination)
 {
     char *dest_str = strdup (json_string_value (destination));
 
     if (make_path (dest_str) != 0)
     {
-        fprintf (stderr, "error: failed to create specified path: %s\n", dest_str);
+        fprintf (stderr, "error: failed to create specified destination path: %s\n", dest_str);
         return -1;
     }
 
-    char *abs_path = resolve_absolute_path (dest_str);
-
-    for (size_t i = 0; i < *dest_count; i++)
-    {
-        if (strcmp (destination_array[i], abs_path) == 0)
-        {
-            fprintf (stderr, "error: destination specified in earlier config: %s\n",
-                     abs_path);
-            free (abs_path);
-            return -1;
-        }
-    }
-
-    destination_array[(*dest_count)++] = abs_path;
     return 0;
 }
 
 static int
-validate_data (json_t *data, config_data *config, char **destination_array,
-               size_t *dest_count)
+validate_data (json_t *data, config_data *config)
 {
     json_t *query, *frequency, *destination, *max_samples, *max_size;
 
@@ -382,10 +363,9 @@ validate_data (json_t *data, config_data *config, char **destination_array,
         return -1;
     }
 
-    // if destionation already exists (or cant be made), gracefully reject.
-    if (validate_destination (destination, destination_array, dest_count) != 0)
+    if (validate_destination (destination) != 0)
     {
-        return 1;
+        return -1;
     }
 
     max_samples = json_object_get (data, "max_samples");
@@ -412,88 +392,184 @@ validate_data (json_t *data, config_data *config, char **destination_array,
 }
 
 static int
-initialise_configs (json_t *root)
+initialise_config (json_t *data)
 {
-    size_t i;
-    char **destination_array = malloc (json_array_size (root) * sizeof (char *));
-    size_t dest_count = 0;
-
-    for (i = 0; i < json_array_size (root); i++)
+    if (!json_is_object (data))
     {
-        json_t *data;
+        fprintf (stderr, "error: config is not a json object\n");
+        return -1;
+    }
 
-        data = json_array_get (root, i);
-        if (!json_is_object (data))
-        {
-            fprintf (stderr, "error: config set %d is not an object\n", (int) (i + 1));
-            json_decref (root);
-            return -1;
-        }
+    config_data *config = malloc (sizeof (config_data));
+    int result = validate_data (data, config);
 
-        config_data *config = malloc (sizeof (config_data));
-        int result = validate_data (data, config, destination_array, &dest_count);
-        if (result == -1)
+    if (result == -1)
+    {
+        fprintf (stderr, "error: bad value in config \n");
+        free (config);
+        return -1;
+    }
+
+    create_logrotate_config (config);
+    g_thread_new (NULL, thread_func, config);
+
+    return 0;
+}
+
+static int
+load_configs_from_directory (const char *config_dir)
+{
+    DIR *dir;
+    struct dirent *entry;
+    char *ext;
+    char *path;
+    json_t *root;
+    json_error_t error;
+
+    dir = opendir (config_dir);
+    if (!dir)
+    {
+        fprintf (stderr, "error: failed to open config directory: %s\n", config_dir);
+        return -1;
+    }
+
+    while ((entry = readdir (dir)) != NULL)
+    {
+        if (entry->d_type != DT_REG)
         {
-            fprintf (stderr, "error: bad value in config set %d \n", (int) (i + 1));
-            json_decref (root);
-            free (config);
-            return -1;
-        }
-        if (result == 1)
-        {
-            fprintf (stderr, "error: skipping config set %d \n", (int) (i + 1));
             continue;
         }
 
-        create_logrotate_config (config);
+        /* Only reads .json files */
+        ext = strrchr (entry->d_name, '.');
+        if ((ext == NULL) || (strcmp (ext, ".json") != 0))
+        {
+            continue;
+        }
+        path = g_strdup_printf ("%s/%s", config_dir, entry->d_name);
 
-        g_thread_new (NULL, thread_func, config);
+        root = json_load_file (path, 0, &error);
+        if (!root)
+        {
+            fprintf (stderr, "error: unable to open file: %s\n", path);
+            json_decref (root);
+            g_free (path);
+            return -1;
+        }
+
+        if (initialise_config (root) != 0)
+        {
+            fprintf (stderr, "error: failed to initialise config from file: %s\n",
+                        path);
+            json_decref (root);
+            g_free (path);
+            return -1;
+        }
     }
-
-    for (size_t i = 0; i < dest_count; i++)
-    {
-        free (destination_array[i]);
-    }
-    free (destination_array);
-
+    
+    closedir (dir);
     return 0;
+}
+
+
+void
+test_compare_json_deep_nulls ()
+{
+    CU_ASSERT_PTR_NULL (compare_json_deep (NULL, NULL));
+    
+    CU_ASSERT_EQUAL (compare_json_deep (NULL, json_object ()), json_null ());
+
+    json_t *old = json_object ();
+    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, NULL), old);
+    json_decref (old);
+}
+
+void
+test_compare_json_deep_different_types ()
+{
+    json_t *old = json_object ();
+    json_t *new = json_string ("new value");
+
+    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, new), old);
+
+    json_decref (old);
+    json_decref (new);
 }
 
 
 int
 main (int argc, char *argv[])
 {
+    int opt;
+    const char *config_dir = NULL;
+    bool unit_test = false;
+    CU_pSuite pSuite;
+    GMainLoop *main_loop = NULL;
+    
+    while ((opt = getopt (argc, argv, "huc:")) != -1)
+    {
+        switch (opt)
+        {
+            case 'u':
+                unit_test = true;
+                break;
+            case 'c':
+                config_dir = optarg;
+                break;
+            break;
+            case '?':
+            case 'h':
+            default:
+                printf ("Usage: %s [-h] [-u] [-c <configdir>]\n"
+                        "  -h   show this help\n"
+                        "  -u   run unit tests\n"
+                        "  -c   use files from <configdir>\n"
+                        ,argv[0]);
+                return 0;
+        }
+    }
+ 
+
+    if (unit_test)
+    {
+        CU_initialize_registry ();
+
+        pSuite = CU_add_suite("compare_json_deep units", NULL, NULL);
+        CU_add_test(pSuite, "NULL values", test_compare_json_deep_nulls);
+        CU_add_test(pSuite, "differing types", test_compare_json_deep_different_types);
+        
+        CU_basic_run_tests();
+        CU_cleanup_registry();
+
+        goto exit;
+    }
+
+
+    if (!config_dir)
+    {
+        fprintf (stderr, "error: No configuration directory path set. Missing -c <configdir>\n");
+        return -1;
+    }
+
     apteryx_init (false);
 
-    json_t *root;
-    json_error_t error;
-
-    if (argc != 2)
+    if (load_configs_from_directory (config_dir) != 0)
     {
-        fprintf (stderr, "usage: %s [PATH/TO/CONFIG.JSON]\n", argv[0]);
-        fprintf (stderr, "Reads config array from PATH/TO/CONFIG.JSON.\n");
-        return -1;
+        goto exit;
     }
 
-    root = json_load_file (argv[1], 0, &error);
-    if (!root)
-    {
-        fprintf (stderr, "error: unable to open file: %s\n", argv[1]);
-        return -1;
-    }
-
-    if (!json_is_array (root))
-    {
-        fprintf (stderr, "error: config is not an array\n");
-        json_decref (root);
-        return -1;
-    }
-
-    initialise_configs (root);
-    json_decref (root);
-
-    GMainLoop *main_loop = g_main_loop_new (NULL, false);
+    main_loop = g_main_loop_new (NULL, false);
     g_main_loop_run (main_loop);
+
+
+  exit:
+    if (main_loop)
+    {
+        g_main_loop_unref (main_loop);
+    }
+
+    /* Cleanup client library */
+    apteryx_shutdown ();
 
     return 0;
 }

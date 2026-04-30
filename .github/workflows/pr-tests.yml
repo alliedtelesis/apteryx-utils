@@ -33,3 +33,5 @@ jobs:
       run: LD_LIBRARY_PATH=./apteryx ./apteryx/apteryxd -b
     - name: Run Alfred unit tests
       run: LD_LIBRARY_PATH=./apteryx:./apteryx-xml:. G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full --error-exitcode=1 --suppressions=./apteryx.suppressions ./alfred -u
+    - name: Run recorder unit tests
+      run: LD_LIBRARY_PATH=./apteryx:. G_SLICE=always-malloc valgrind --keep-debuginfo=yes --leak-check=full --error-exitcode=1 --suppressions=./apteryx.suppressions ./recorder -u

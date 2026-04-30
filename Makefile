@@ -45,6 +45,7 @@ EXTRA_CFLAGS += -DHAVE_LIBXML2 $(shell $(PKG_CONFIG) --cflags libxml-2.0)
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs libxml-2.0)
 EXTRA_CFLAGS += -DHAVE_LIBJANSSON $(shell $(PKG_CONFIG) --cflags jansson)
 EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs jansson)
+EXTRA_LDFLAGS += $(shell $(PKG_CONFIG) --libs cunit)
 
 all: alfred apteryx-sync apteryx-saver recorder
 
