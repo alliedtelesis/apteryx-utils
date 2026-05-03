@@ -475,13 +475,23 @@ load_configs_from_directory (const char *config_dir)
 void
 test_compare_json_deep_nulls ()
 {
-    CU_ASSERT_PTR_NULL (compare_json_deep (NULL, NULL));
+    json_t *old = NULL;
+    json_t *new = NULL;
+    json_t *result = NULL;
+    CU_ASSERT_PTR_NULL (compare_json_deep (old, new));
     
-    CU_ASSERT_EQUAL (compare_json_deep (NULL, json_object ()), json_null ());
+    new = json_object ();
+    result = json_null ();
+    CU_ASSERT_EQUAL (compare_json_deep (old, new), result);
+    json_decref (new);
+    json_decref (result);
 
-    json_t *old = json_object ();
-    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, NULL), old);
+    old = json_object ();
+    new = NULL;
+    result = old;
+    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, NULL), result);
     json_decref (old);
+    json_decref (result);
 }
 
 void
@@ -489,11 +499,13 @@ test_compare_json_deep_different_types ()
 {
     json_t *old = json_object ();
     json_t *new = json_string ("new value");
+    json_t *result = old;
 
-    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, new), old);
+    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, new), result);
 
     json_decref (old);
     json_decref (new);
+    json_decref (result);
 }
 
 
