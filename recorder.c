@@ -11,11 +11,16 @@
 #include <dirent.h>
 #include <libgen.h>
 #include <jansson.h>
+#include <ftw.h>
+#include <unistd.h>
 #include <CUnit/CUnit.h>
 #include <CUnit/Basic.h>
 
-static const int path_buffer = 256;
 static const int json_indent = 2;
+
+/* Override used for testing. NULL means use default */
+static const char *logrotate_dir_override = NULL;
+#define LOGROTATE_DIR_DEFAULT "/etc/logrotate.d"
 
 static json_t *compare_json_deep (json_t *old_json, json_t *new_json);
 
@@ -30,6 +35,7 @@ typedef struct _config_data
 } config_data;
 
 
+/* Used to convert apteryx result into regular JSON */
 json_t *
 gnode_to_json (const GNode *node)
 {
@@ -62,6 +68,7 @@ gnode_to_json (const GNode *node)
     return obj;
 }
 
+/* Generates destination directories if needed */
 static int
 make_path (char *path)
 {
@@ -79,6 +86,7 @@ make_path (char *path)
 }
 
 
+/* Compares JSON objects by comparing their individual values */
 static json_t *
 compare_objects (json_t *old_obj, json_t *new_obj)
 {
@@ -111,6 +119,7 @@ compare_objects (json_t *old_obj, json_t *new_obj)
     return changes;
 }
 
+/* Tries to compare primitively, otherwise defers to compare_objects for recursion */
 static json_t *
 compare_json_deep (json_t *old_json, json_t *new_json)
 {
@@ -136,13 +145,13 @@ compare_json_deep (json_t *old_json, json_t *new_json)
     return compare_objects (old_json, new_json);
 }
 
+/* Creates, or edits, the JSON diff file */
 static int
 write_diff (json_t *current_json, const char *path_to_diff)
 {
     int error_code;
     json_error_t error;
     json_t *storage = json_load_file (path_to_diff, 0, &error);
-    json_t *diff = json_object ();
 
     if (!storage)
     {
@@ -161,6 +170,7 @@ write_diff (json_t *current_json, const char *path_to_diff)
 
     json_t *changes =
         compare_json_deep (json_object_get (storage, "current"), current_json);
+    json_t *diff = json_object ();
 
     json_object_set_new (diff, "timestamp",
                          json_deep_copy (json_object_get (storage, "timestamp")));
@@ -177,11 +187,11 @@ write_diff (json_t *current_json, const char *path_to_diff)
 }
 
 
-// Creates a unique name for logrotate conf based on destination
+/* Creates a unique name for logrotate config file based on specified diff destination */
 static char *
 sanitize_path_for_config (const char *path)
 {
-    char *result = malloc (strlen (path) + 7);
+    char *result = malloc (strlen (path) + 8);
     strcpy (result, "config-");
     char *dst = result + 7;
 
@@ -201,25 +211,21 @@ sanitize_path_for_config (const char *path)
     return result;
 }
 
+/* Turns a relative path into absolute for consistent comparison */
 static char *
 resolve_absolute_path (const char *path)
 {
-    // If full path already exists, resolve directly
+    /* Path should always exist, as it will crash earlier if not. File might not */
     char *resolved = realpath (path, NULL);
     if (resolved)
     {
         return resolved;
     }
 
-    // If there is no file, resolve parent directory instead (& append name)
+    /* If there is no file, resolve parent directory, then append name */
     char *path_copy = strdup (path);
     char *resolved_dir = realpath (dirname (path_copy), NULL);
     free (path_copy);
-
-    if (!resolved_dir)
-    {
-        return NULL;
-    }
 
     path_copy = strdup (path);
     char *result = malloc (strlen (resolved_dir) + strlen (basename (path_copy)) + 2);
@@ -230,19 +236,32 @@ resolve_absolute_path (const char *path)
     return result;
 }
 
-static void
+/* Makes a logrotate config based on user-specified settings */
+static int
 create_logrotate_config (config_data *config)
 {
     char *absolute_path = resolve_absolute_path (config->destination);
     if (!absolute_path)
     {
         fprintf (stderr, "error: failed to resolve path: %s\n", config->destination);
-        return;
+        return -1;
     }
 
     char *config_name = sanitize_path_for_config (config->destination);
-    char config_path[path_buffer];
-    snprintf (config_path, path_buffer, "/etc/logrotate.d/%s", config_name);
+    const char *out_dir = logrotate_dir_override ? logrotate_dir_override
+        : LOGROTATE_DIR_DEFAULT;
+
+    int n = snprintf (NULL, 0, "%s/%s", out_dir, config_name);
+    if (n < 0)
+    {
+        fprintf (stderr, "error: failed to build logrotate config path\n");
+        free (absolute_path);
+        free (config_name);
+        return -1;
+    }
+
+    char *config_path = malloc (n + 1);
+    snprintf (config_path, n + 1, "%s/%s", out_dir, config_name);
 
     FILE *f = fopen (config_path, "w");
     if (!f)
@@ -250,23 +269,26 @@ create_logrotate_config (config_data *config)
         fprintf (stderr, "error: failed to create logrotate config: %s\n", config_path);
         free (absolute_path);
         free (config_name);
-        return;
+        free (config_path);
+        return -1;
     }
 
-    fprintf (f, "%s {\n", absolute_path);
-    fprintf (f, "    size %ldM\n", config->max_size);
-    fprintf (f, "    rotate %d\n", config->max_samples);
-    fprintf (f, "    missingok\n");
-    fprintf (f, "    notifempty\n");
-    fprintf (f, "    nocreate\n");
-    fprintf (f, "}\n");
+    fprintf (f, "%s {\n"
+             "    size %ldM\n"
+             "    rotate %d\n"
+             "    missingok\n"
+             "    notifempty\n"
+             "    nocreate\n" "}\n", absolute_path, config->max_size, config->max_samples);
 
     fclose (f);
     free (absolute_path);
     free (config_name);
+    free (config_path);
+    return 0;
 }
 
 
+/* Main function called by the GLib thread */
 static gboolean
 polling_callback (gpointer user_data)
 {
@@ -283,7 +305,7 @@ polling_callback (gpointer user_data)
     if (!json_from_tree)
     {
         fprintf (stderr, "error: could not fetch JSON from query: %s\n", config->query);
-        return G_SOURCE_CONTINUE;
+        return G_SOURCE_CONTINUE;   // Continues in case it is a temporary apteryx issue
     }
 
     if (write_diff (json_from_tree, config->destination) != 0)
@@ -291,7 +313,7 @@ polling_callback (gpointer user_data)
         fprintf (stderr, "error: could not write diff. Check destination: %s\n",
                  config->destination);
         json_decref (json_from_tree);
-        return G_SOURCE_REMOVE;
+        return G_SOURCE_REMOVE; // Breaks as the destination has likely been removed
     }
 
     json_decref (json_from_tree);
@@ -299,6 +321,7 @@ polling_callback (gpointer user_data)
     return G_SOURCE_CONTINUE;
 }
 
+/* Setup for the GLib thread */
 static gpointer
 thread_func (gpointer user_data)
 {
@@ -322,23 +345,76 @@ thread_func (gpointer user_data)
     return NULL;
 }
 
+/* Ensures there are no configs writing to the same place. Uses destination, config-file pairs*/
+static GHashTable *destination_registry = NULL;
 
-static int
-validate_destination (json_t *destination)
+static void
+destination_registry_free_all ()
 {
-    char *dest_str = strdup (json_string_value (destination));
+    if (destination_registry)
+    {
+        g_hash_table_destroy (destination_registry);
+        destination_registry = NULL;
+    }
+}
+
+/* Adds destination to table. Throws error if it is already present */
+static int
+destination_registry_add (const char *destination, const char *config_path)
+{
+    destination_registry = destination_registry ? destination_registry :
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+
+    gchar *key = resolve_absolute_path (destination);
+
+    const char *first_seen = g_hash_table_lookup (destination_registry, key);
+    if (first_seen)
+    {
+        fprintf (stderr,
+                 "error: duplicate destination '%s' in %s "
+                 "(already registered by %s)\n",
+                 key, config_path ? config_path : "(unknown)", first_seen);
+        g_free (key);
+        return -1;
+    }
+
+    g_hash_table_insert (destination_registry, key,
+                         g_strdup (config_path ? config_path : "(unknown)"));
+    return 0;
+}
+
+/* Ensures destination can be created, and has not already been claimed */
+static int
+validate_destination (const char *destination_path, const char *config_path)
+{
+    if (!destination_path || !*destination_path)
+    {
+        fprintf (stderr, "error: destination path not provided\n");
+        return -1;
+    }
+
+    char *dest_str = strdup (destination_path);
 
     if (make_path (dest_str) != 0)
     {
-        fprintf (stderr, "error: failed to create specified destination path: %s\n", dest_str);
+        fprintf (stderr,
+                 "error: failed to create destination path: %s\n", destination_path);
+        free (dest_str);
+        return -1;
+    }
+    free (dest_str);
+
+    if (destination_registry_add (destination_path, config_path) != 0)
+    {
         return -1;
     }
 
     return 0;
 }
 
+/* Validates the data provided in the config file. Mostly checks types */
 static int
-validate_data (json_t *data, config_data *config)
+validate_data (json_t *data, config_data *config, const char *config_path)
 {
     json_t *query, *frequency, *destination, *max_samples, *max_size;
 
@@ -363,7 +439,7 @@ validate_data (json_t *data, config_data *config)
         return -1;
     }
 
-    if (validate_destination (destination) != 0)
+    if (validate_destination (json_string_value (destination), config_path) != 0)
     {
         return -1;
     }
@@ -391,8 +467,9 @@ validate_data (json_t *data, config_data *config)
     return 0;
 }
 
+/* Tries to setup thread from config file object */
 static int
-initialise_config (json_t *data)
+initialise_config (json_t *data, const char *config_path)
 {
     if (!json_is_object (data))
     {
@@ -401,21 +478,28 @@ initialise_config (json_t *data)
     }
 
     config_data *config = malloc (sizeof (config_data));
-    int result = validate_data (data, config);
-
-    if (result == -1)
+    int validation = validate_data (data, config, config_path);
+    if (validation != 0)
     {
         fprintf (stderr, "error: bad value in config \n");
         free (config);
         return -1;
     }
 
-    create_logrotate_config (config);
+    validation = create_logrotate_config (config);
+    if (validation != 0)
+    {
+        fprintf (stderr, "error: could not start logrotate \n");
+        free (config);
+        return -1;
+    }
+
     g_thread_new (NULL, thread_func, config);
 
     return 0;
 }
 
+/* Gets all JSON files from specified directory and tries to read them */
 static int
 load_configs_from_directory (const char *config_dir)
 {
@@ -452,59 +536,254 @@ load_configs_from_directory (const char *config_dir)
         if (!root)
         {
             fprintf (stderr, "error: unable to open file: %s\n", path);
-            json_decref (root);
             g_free (path);
+            closedir (dir);
             return -1;
         }
 
-        if (initialise_config (root) != 0)
+        if (initialise_config (root, path) != 0)
         {
-            fprintf (stderr, "error: failed to initialise config from file: %s\n",
-                        path);
+            fprintf (stderr, "error: failed to initialise config from file: %s\n", path);
             json_decref (root);
             g_free (path);
+            closedir (dir);
             return -1;
         }
+
+        json_decref (root);
+        g_free (path);
     }
-    
+
     closedir (dir);
     return 0;
 }
 
 
 void
-test_compare_json_deep_nulls ()
+test_compare_json_deep_both_null_returns_null ()
 {
-    json_t *old = NULL;
-    json_t *new = NULL;
-    json_t *result = NULL;
-    CU_ASSERT_PTR_NULL (compare_json_deep (old, new));
-    
-    new = json_object ();
-    result = json_null ();
-    CU_ASSERT_EQUAL (compare_json_deep (old, new), result);
-    json_decref (new);
-    json_decref (result);
+    json_t *result = compare_json_deep (NULL, NULL);
+    CU_ASSERT_PTR_NULL (result);
+}
 
-    old = json_object ();
-    new = NULL;
-    result = old;
-    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, NULL), result);
-    json_decref (old);
+void
+test_compare_json_deep_old_null_returns_json_null ()
+{
+    json_t *new_json = json_object ();
+    json_t *result = compare_json_deep (NULL, new_json);
+    json_t *expected = json_null ();
+
+    CU_ASSERT_EQUAL (result, expected);
+
+    json_decref (new_json);
+    json_decref (result);
+    json_decref (expected);
+}
+
+void
+test_compare_json_deep_new_null_returns_old_value ()
+{
+    json_t *old_json = json_object ();
+    json_t *result = compare_json_deep (old_json, NULL);
+
+    CU_ASSERT_PTR_EQUAL (result, old_json);
+
+    json_decref (old_json);
     json_decref (result);
 }
 
 void
-test_compare_json_deep_different_types ()
+test_compare_json_deep_type_mismatch_returns_old_value ()
 {
-    json_t *old = json_object ();
-    json_t *new = json_string ("new value");
-    json_t *result = old;
+    json_t *old_json = json_object ();
+    json_t *new_json = json_string ("new value");
+    json_t *result = compare_json_deep (old_json, new_json);
 
-    CU_ASSERT_PTR_EQUAL (compare_json_deep (old, new), result);
+    CU_ASSERT_PTR_EQUAL (result, old_json);
 
-    json_decref (old);
-    json_decref (new);
+    json_decref (old_json);
+    json_decref (new_json);
+    json_decref (result);
+}
+
+void
+test_compare_json_deep_equal_string_returns_null ()
+{
+    json_t *old_json = json_string ("value");
+    json_t *new_json = json_string ("value");
+    json_t *result = compare_json_deep (old_json, new_json);
+
+    CU_ASSERT_PTR_NULL (result);
+
+    json_decref (old_json);
+    json_decref (new_json);
+}
+
+void
+test_compare_json_deep_equal_integer_returns_null ()
+{
+    json_t *old_json = json_integer (42);
+    json_t *new_json = json_integer (42);
+    json_t *result = compare_json_deep (old_json, new_json);
+
+    CU_ASSERT_PTR_NULL (result);
+
+    json_decref (old_json);
+    json_decref (new_json);
+}
+
+void
+test_compare_json_deep_different_string_returns_old_value ()
+{
+    json_t *old_json = json_string ("value");
+    json_t *new_json = json_string ("new value");
+    json_t *result = compare_json_deep (old_json, new_json);
+
+    CU_ASSERT_PTR_EQUAL (result, old_json);
+
+    json_decref (old_json);
+    json_decref (new_json);
+    json_decref (result);
+}
+
+void
+test_compare_json_deep_different_integer_returns_old_value ()
+{
+    json_t *old_json = json_integer (42);
+    json_t *new_json = json_integer (41);
+    json_t *result = compare_json_deep (old_json, new_json);
+
+    CU_ASSERT_PTR_EQUAL (result, old_json);
+
+    json_decref (old_json);
+    json_decref (new_json);
+    json_decref (result);
+}
+
+
+void
+test_compare_json_deep_equal_arrays_returns_null ()
+{
+    json_t *old_arr = json_array ();
+    json_array_append_new (old_arr, json_integer (1));
+    json_array_append_new (old_arr, json_integer (2));
+    json_t *new_arr = json_array ();
+    json_array_append_new (new_arr, json_integer (1));
+    json_array_append_new (new_arr, json_integer (2));
+    json_t *result = compare_json_deep (old_arr, new_arr);
+
+    CU_ASSERT_PTR_NULL (result);
+
+    json_decref (old_arr);
+    json_decref (new_arr);
+}
+
+void
+test_compare_json_deep_different_arrays_returns_old_array ()
+{
+    json_t *old_arr = json_array ();
+    json_array_append_new (old_arr, json_integer (1));
+    json_array_append_new (old_arr, json_integer (2));
+    json_t *new_arr = json_array ();
+    json_array_append_new (new_arr, json_integer (1));
+    json_array_append_new (new_arr, json_integer (2));
+    json_array_append_new (new_arr, json_integer (3));
+    json_t *result = compare_json_deep (old_arr, new_arr);
+
+    CU_ASSERT_PTR_EQUAL (result, old_arr);
+
+    json_decref (old_arr);
+    json_decref (new_arr);
+    json_decref (result);
+}
+
+
+void
+test_compare_json_deep_empty_objects_returns_null ()
+{
+    json_t *old_obj = json_object ();
+    json_t *new_obj = json_object ();
+    json_t *result = compare_json_deep (old_obj, new_obj);
+
+    CU_ASSERT_PTR_NULL (result);
+
+    json_decref (old_obj);
+    json_decref (new_obj);
+}
+
+void
+test_compare_json_deep_equal_object_values_returns_null ()
+{
+    json_t *old_obj = json_object ();
+    json_t *new_obj = json_object ();
+    json_object_set_new (old_obj, "key1", json_string ("value"));
+    json_object_set_new (new_obj, "key1", json_string ("value"));
+    json_t *result = compare_json_deep (old_obj, new_obj);
+
+    CU_ASSERT_PTR_NULL (result);
+
+    json_decref (old_obj);
+    json_decref (new_obj);
+}
+
+
+void
+test_compare_json_deep_changed_object_value_returns_old_value_object ()
+{
+    json_t *old_obj = json_object ();
+    json_t *new_obj = json_object ();
+    json_object_set_new (old_obj, "key1", json_string ("value"));
+    json_object_set_new (new_obj, "key1", json_string ("new value"));
+    json_t *result = compare_json_deep (old_obj, new_obj);
+
+    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
+    CU_ASSERT_TRUE (json_equal (result, old_obj));
+
+    json_decref (old_obj);
+    json_decref (new_obj);
+    json_decref (result);
+}
+
+
+void
+test_compare_json_deep_added_key_returns_json_null_marker ()
+{
+    json_t *old_obj = json_object ();
+    json_t *new_obj = json_object ();
+    json_object_set_new (new_obj, "key1", json_string ("value"));
+
+    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *diff = json_object_get (result, "key1");
+    json_t *expected_null = json_null ();
+
+    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
+    CU_ASSERT_EQUAL (diff, expected_null);
+
+    json_decref (expected_null);
+    json_decref (old_obj);
+    json_decref (new_obj);
+    json_decref (result);
+}
+
+void
+test_compare_json_deep_removed_key_returns_old_value ()
+{
+    json_t *old_obj = json_object ();
+    json_t *new_obj = json_object ();
+    json_object_set_new (old_obj, "key1", json_string ("value"));
+    json_object_set_new (old_obj, "key2", json_string ("new value"));
+    json_object_set_new (new_obj, "key1", json_string ("value"));
+
+    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *diff = json_object_get (result, "key2");
+    json_t *expected = json_string ("new value");
+
+    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
+    CU_ASSERT_TRUE (json_equal (diff, expected));
+
+    json_decref (expected);
+    json_decref (old_obj);
+    json_decref (new_obj);
     json_decref (result);
 }
 
@@ -517,49 +796,80 @@ main (int argc, char *argv[])
     bool unit_test = false;
     CU_pSuite pSuite;
     GMainLoop *main_loop = NULL;
-    
+
     while ((opt = getopt (argc, argv, "huc:")) != -1)
     {
         switch (opt)
         {
-            case 'u':
-                unit_test = true;
-                break;
-            case 'c':
-                config_dir = optarg;
-                break;
+        case 'u':
+            unit_test = true;
             break;
-            case '?':
-            case 'h':
-            default:
-                printf ("Usage: %s [-h] [-u] [-c <configdir>]\n"
-                        "  -h   show this help\n"
-                        "  -u   run unit tests\n"
-                        "  -c   use files from <configdir>\n"
-                        ,argv[0]);
-                return 0;
+        case 'c':
+            config_dir = optarg;
+            break;
+        case '?':
+        case 'h':
+        default:
+            printf ("Usage: %s [-h] [-u] [-c <configdir>]\n"
+                    "  -h   show this help\n"
+                    "  -u   run unit tests\n"
+                    "  -c   use files from <configdir>\n", argv[0]);
+            return 0;
         }
     }
- 
+
 
     if (unit_test)
     {
         CU_initialize_registry ();
 
-        pSuite = CU_add_suite("compare_json_deep units", NULL, NULL);
-        CU_add_test(pSuite, "NULL values", test_compare_json_deep_nulls);
-        CU_add_test(pSuite, "differing types", test_compare_json_deep_different_types);
-        
-        CU_basic_run_tests();
-        CU_cleanup_registry();
+        pSuite = CU_add_suite ("unit::compare_json_deep", NULL, NULL);
+        CU_add_test (pSuite, "both_null_returns_null",
+                     test_compare_json_deep_both_null_returns_null);
+        CU_add_test (pSuite, "old_null_returns_json_null",
+                     test_compare_json_deep_old_null_returns_json_null);
+        CU_add_test (pSuite, "new_null_returns_old_value",
+                     test_compare_json_deep_new_null_returns_old_value);
+        CU_add_test (pSuite, "type_mismatch_returns_old_value",
+                     test_compare_json_deep_type_mismatch_returns_old_value);
+        CU_add_test (pSuite, "equal_string_returns_null",
+                     test_compare_json_deep_equal_string_returns_null);
+        CU_add_test (pSuite, "equal_integer_returns_null",
+                     test_compare_json_deep_equal_integer_returns_null);
+        CU_add_test (pSuite, "different_string_returns_old_value",
+                     test_compare_json_deep_different_string_returns_old_value);
+        CU_add_test (pSuite, "different_integer_returns_old_value",
+                     test_compare_json_deep_different_integer_returns_old_value);
+        CU_add_test (pSuite, "equal_arrays_returns_null",
+                     test_compare_json_deep_equal_arrays_returns_null);
+        CU_add_test (pSuite, "different_arrays_returns_old_array",
+                     test_compare_json_deep_different_arrays_returns_old_array);
 
-        goto exit;
+        pSuite = CU_add_suite ("integration::compare_json_deep_objects", NULL, NULL);
+        CU_add_test (pSuite, "empty_objects_returns_null",
+                     test_compare_json_deep_empty_objects_returns_null);
+        CU_add_test (pSuite, "equal_object_values_returns_null",
+                     test_compare_json_deep_equal_object_values_returns_null);
+        CU_add_test (pSuite, "changed_object_value_returns_old_value_object",
+                     test_compare_json_deep_changed_object_value_returns_old_value_object);
+        CU_add_test (pSuite, "added_key_returns_json_null_marker",
+                     test_compare_json_deep_added_key_returns_json_null_marker);
+        CU_add_test (pSuite, "removed_key_returns_old_value",
+                     test_compare_json_deep_removed_key_returns_old_value);
+
+        CU_basic_set_mode (CU_BRM_VERBOSE);
+        CU_basic_run_tests ();
+        int failures = CU_get_number_of_failures ();
+        CU_cleanup_registry ();
+
+        return failures ? -1 : 0;
     }
 
 
     if (!config_dir)
     {
-        fprintf (stderr, "error: No configuration directory path set. Missing -c <configdir>\n");
+        fprintf (stderr,
+                 "error: No configuration directory path set. Missing -c <configdir>\n");
         return -1;
     }
 
@@ -579,6 +889,9 @@ main (int argc, char *argv[])
     {
         g_main_loop_unref (main_loop);
     }
+
+    /* Cleanup destination registry */
+    destination_registry_free_all ();
 
     /* Cleanup client library */
     apteryx_shutdown ();
