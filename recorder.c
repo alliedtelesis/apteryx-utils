@@ -13,14 +13,16 @@
 #include <jansson.h>
 #include <ftw.h>
 #include <unistd.h>
+#include <signal.h>
 #include <CUnit/CUnit.h>
 #include <CUnit/Basic.h>
 
 static const int json_indent = 2;
 
-/* Override used for testing. NULL means use default */
+/* Overrides the default logrotate output directory. Set via -l or in tests. NULL means use default */
 static const char *logrotate_dir_override = NULL;
-#define LOGROTATE_DIR_DEFAULT "/etc/logrotate.d"
+#define LOGROTATE_DIR_DEFAULT "/etc/logrotate-conf.d"
+#define LOGROTATE_INCLUDE_FILE "/etc/logrotate.d/recorder"
 
 static json_t *compare_json_deep (json_t *old_json, json_t *new_json);
 
@@ -31,9 +33,18 @@ typedef struct _config_data
     char *destination;
     int max_samples;
     long max_size;
+
+    guint initial_delay;
     GMainLoop *loop;
+    GMainContext *context;
+    GThread *thread;
+    GMutex mutex;
+    GCond cond;
+    gboolean thread_ready;
 } config_data;
 
+static GHashTable *destination_registry = NULL;
+static GPtrArray *active_configs = NULL;
 
 /* Used to convert apteryx result into regular JSON */
 json_t *
@@ -236,6 +247,27 @@ resolve_absolute_path (const char *path)
     return result;
 }
 
+/* Writes a single include directive, allowing logrotate to read from our logrotate config directory */
+static int
+create_logrotate_include (void)
+{
+    const char *out_dir = logrotate_dir_override ? logrotate_dir_override
+        : LOGROTATE_DIR_DEFAULT;
+
+    FILE *f = fopen (LOGROTATE_INCLUDE_FILE, "w");
+    if (!f)
+    {
+        fprintf (stderr, "warning: failed to create logrotate include file %s: %s\n"
+                 "         logrotate will not pick up recorder configs automatically\n",
+                 LOGROTATE_INCLUDE_FILE, strerror (errno));
+        return -1;
+    }
+
+    fprintf (f, "include %s\n", out_dir);
+    fclose (f);
+    return 0;
+}
+
 /* Makes a logrotate config based on user-specified settings */
 static int
 create_logrotate_config (config_data *config)
@@ -252,16 +284,19 @@ create_logrotate_config (config_data *config)
         : LOGROTATE_DIR_DEFAULT;
 
     int n = snprintf (NULL, 0, "%s/%s", out_dir, config_name);
-    if (n < 0)
+    char *config_path = malloc (n + 1);
+    snprintf (config_path, n + 1, "%s/%s", out_dir, config_name);
+    
+    char *directory_to_write = strdup (config_path);
+    if (make_path (directory_to_write) != 0)
     {
         fprintf (stderr, "error: failed to build logrotate config path\n");
         free (absolute_path);
         free (config_name);
+        free (directory_to_write);
         return -1;
     }
-
-    char *config_path = malloc (n + 1);
-    snprintf (config_path, n + 1, "%s/%s", out_dir, config_name);
+    free (directory_to_write);
 
     FILE *f = fopen (config_path, "w");
     if (!f)
@@ -274,7 +309,7 @@ create_logrotate_config (config_data *config)
     }
 
     fprintf (f, "%s {\n"
-             "    size %ldM\n"
+             "    size %ldk\n"
              "    rotate %d\n"
              "    missingok\n"
              "    notifempty\n"
@@ -321,53 +356,241 @@ polling_callback (gpointer user_data)
     return G_SOURCE_CONTINUE;
 }
 
+/* Helper to schedule a callback based on a delay */
+static void
+schedule_periodic_polling (config_data *config, GMainContext *context,
+                           GSourceFunc callback_function, long delay)
+{
+    GSource *timeout = g_timeout_source_new_seconds (delay);
+    g_source_set_callback (timeout, callback_function, config, NULL);
+    g_source_attach (timeout, context);
+    g_source_unref (timeout);
+}
+
+/* Used when a thread is interrupted and has to wait for a non-standard length */
+static gboolean
+initial_polling_callback (gpointer user_data)
+{
+    config_data *config = (config_data *) user_data;
+
+    if (polling_callback (config) == G_SOURCE_CONTINUE)
+    {
+        schedule_periodic_polling (config, g_main_context_get_thread_default (),
+                                   polling_callback, config->frequency);
+    }
+
+    return G_SOURCE_REMOVE;
+}
+
+/* Calculates the remaining delay for an interrupted thread */
+static guint
+calculate_initial_delay_at (long frequency, time_t last_poll_timestamp, time_t now)
+{
+    // If there is no record, or it is somehow in the future, just wait the full frequency
+    if (last_poll_timestamp == 0 || now < last_poll_timestamp)
+    {
+        return (guint) frequency;
+    }
+
+    time_t elapsed = now - last_poll_timestamp;
+    if (elapsed >= frequency)
+    {
+        return 0;
+    }
+
+    return (guint) (frequency - elapsed);
+}
+
+/* Determines when the last poll was */
+static time_t
+read_last_poll_timestamp (const char *path_to_diff)
+{
+    json_error_t error;
+    json_t *storage = json_load_file (path_to_diff, 0, &error);
+    if (!storage)
+    {
+        return 0;
+    }
+
+    json_t *timestamp = json_object_get (storage, "timestamp");
+    time_t result = json_is_integer (timestamp) ?
+        (time_t) json_integer_value (timestamp) : 0;
+
+    json_decref (storage);
+    return result;
+}
+
 /* Setup for the GLib thread */
+static gboolean
+quit_loop_cb (gpointer user_data)
+{
+    g_main_loop_quit ((GMainLoop *) user_data);
+    return G_SOURCE_REMOVE;
+}
+
+/* Controls the setup and teardown of its config alongside poll rebooting */
 static gpointer
 thread_func (gpointer user_data)
 {
     config_data *config = (config_data *) user_data;
 
     GMainContext *context = g_main_context_new ();
-    config->loop = g_main_loop_new (context, FALSE);
+    GMainLoop *loop = g_main_loop_new (context, FALSE);
+
+    g_mutex_lock (&config->mutex);
+    config->context = context;
+    config->loop = loop;
+    config->thread_ready = TRUE;
+    g_cond_signal (&config->cond);
+    g_mutex_unlock (&config->mutex);
 
     g_main_context_push_thread_default (context);
 
-    GSource *timeout = g_timeout_source_new_seconds (config->frequency);
-    g_source_set_callback (timeout, polling_callback, config, NULL);
-    g_source_attach (timeout, context);
-    g_source_unref (timeout);
-
-    g_main_loop_run (config->loop);
+    schedule_periodic_polling (config, context, initial_polling_callback,
+                               config->initial_delay);
+    g_main_loop_run (loop);
 
     g_main_context_pop_thread_default (context);
-    g_main_context_unref (context);
 
+    g_mutex_lock (&config->mutex);
+    config->loop = NULL;
+    config->context = NULL;
+    config->thread_ready = FALSE;
+    g_mutex_unlock (&config->mutex);
+
+    g_main_loop_unref (loop);
+    g_main_context_unref (context);
     return NULL;
 }
 
-/* Ensures there are no configs writing to the same place. Uses destination, config-file pairs*/
-static GHashTable *destination_registry = NULL;
+/* Frees data on error */
+static void
+config_data_free (config_data *config)
+{
+    if (config)
+    {
+        free (config->query);
+        free (config->destination);
+        g_mutex_clear (&config->mutex);
+        g_cond_clear (&config->cond);
+        free (config);
+    }
+}
 
+/* Frees provided objects (either local or global) */
+static void
+free_config_set (GHashTable *registry, GPtrArray *configs)
+{
+    if (configs)
+    {
+        g_ptr_array_free (configs, TRUE);
+    }
+    if (registry)
+    {
+        g_hash_table_destroy (registry);
+    }
+}
+
+/* Controls the teardown of an entire thread  */
+static void
+stop_config_thread (config_data *config)
+{
+    if (!config || !config->thread)
+    {
+        return;
+    }
+
+    g_mutex_lock (&config->mutex);
+
+    /* Wait for thread startup to publish context/loop */
+    while (!config->thread_ready)
+    {
+        g_cond_wait (&config->cond, &config->mutex);
+    }
+
+    GMainContext *context = config->context ? g_main_context_ref (config->context) : NULL;
+    GMainLoop *loop = config->loop ? g_main_loop_ref (config->loop) : NULL;
+    g_mutex_unlock (&config->mutex);
+
+    if (context && loop)
+    {
+        g_main_context_invoke_full (context,
+                                    G_PRIORITY_DEFAULT,
+                                    quit_loop_cb, loop, (GDestroyNotify) g_main_loop_unref);
+    }
+    else if (loop)
+    {
+        g_main_loop_quit (loop);
+        g_main_loop_unref (loop);
+    }
+
+    if (context)
+    {
+        g_main_context_unref (context);
+    }
+
+    g_thread_join (config->thread); // Wait for thread to finish and clean itself up
+    config->thread = NULL;
+}
+
+/* Iterates through configs and stops them */
+static void
+stop_config_set (GPtrArray *configs)
+{
+    if (!configs)
+    {
+        return;
+    }
+
+    for (guint i = 0; i < configs->len; i++)
+    {
+        stop_config_thread (g_ptr_array_index (configs, i));
+    }
+}
+
+/* Iterates through configs and starts them */
+static int
+start_config_set (GPtrArray *configs)
+{
+    if (!configs)
+    {
+        return 0;
+    }
+
+    for (guint i = 0; i < configs->len; i++)
+    {
+        config_data *config = g_ptr_array_index (configs, i);
+
+        config->thread = g_thread_new (NULL, thread_func, config);
+        if (!config->thread)
+        {
+            fprintf (stderr, "error: failed to start config thread for %s\n",
+                     config->destination);
+            stop_config_set (configs);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Frees global variables */
 static void
 destination_registry_free_all ()
 {
-    if (destination_registry)
-    {
-        g_hash_table_destroy (destination_registry);
-        destination_registry = NULL;
-    }
+    free_config_set (destination_registry, active_configs);
+    destination_registry = NULL;
+    active_configs = NULL;
 }
 
 /* Adds destination to table. Throws error if it is already present */
 static int
-destination_registry_add (const char *destination, const char *config_path)
+destination_registry_add (GHashTable *registry,
+                          const char *destination, const char *config_path)
 {
-    destination_registry = destination_registry ? destination_registry :
-        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
-
     gchar *key = resolve_absolute_path (destination);
 
-    const char *first_seen = g_hash_table_lookup (destination_registry, key);
+    const char *first_seen = g_hash_table_lookup (registry, key);
     if (first_seen)
     {
         fprintf (stderr,
@@ -378,14 +601,14 @@ destination_registry_add (const char *destination, const char *config_path)
         return -1;
     }
 
-    g_hash_table_insert (destination_registry, key,
-                         g_strdup (config_path ? config_path : "(unknown)"));
+    g_hash_table_insert (registry, key, g_strdup (config_path ? config_path : "(unknown)"));
     return 0;
 }
 
 /* Ensures destination can be created, and has not already been claimed */
 static int
-validate_destination (const char *destination_path, const char *config_path)
+validate_destination (GHashTable *registry,
+                      const char *destination_path, const char *config_path)
 {
     if (!destination_path || !*destination_path)
     {
@@ -404,7 +627,7 @@ validate_destination (const char *destination_path, const char *config_path)
     }
     free (dest_str);
 
-    if (destination_registry_add (destination_path, config_path) != 0)
+    if (destination_registry_add (registry, destination_path, config_path) != 0)
     {
         return -1;
     }
@@ -414,7 +637,8 @@ validate_destination (const char *destination_path, const char *config_path)
 
 /* Validates the data provided in the config file. Mostly checks types */
 static int
-validate_data (json_t *data, config_data *config, const char *config_path)
+validate_and_set_data (json_t *data,
+               config_data *config, GHashTable *registry, const char *config_path)
 {
     json_t *query, *frequency, *destination, *max_samples, *max_size;
 
@@ -431,6 +655,11 @@ validate_data (json_t *data, config_data *config, const char *config_path)
         fprintf (stderr, "error: frequency is not an integer\n");
         return -1;
     }
+    if (json_integer_value (frequency) <= 0)
+    {
+        fprintf (stderr, "error: frequency must be greater than 0\n");
+        return -1;
+    }
 
     destination = json_object_get (data, "destination");
     if (!json_is_string (destination))
@@ -439,7 +668,7 @@ validate_data (json_t *data, config_data *config, const char *config_path)
         return -1;
     }
 
-    if (validate_destination (json_string_value (destination), config_path) != 0)
+    if (validate_destination (registry, json_string_value (destination), config_path) != 0)
     {
         return -1;
     }
@@ -450,6 +679,11 @@ validate_data (json_t *data, config_data *config, const char *config_path)
         fprintf (stderr, "error: max_samples is not an integer\n");
         return -1;
     }
+    if (json_integer_value (max_samples) <= 0)
+    {
+        fprintf (stderr, "error: max_samples must be greater than 0\n");
+        return -1;
+    }
 
     max_size = json_object_get (data, "max_size");
     if (!json_is_integer (max_size))
@@ -457,6 +691,13 @@ validate_data (json_t *data, config_data *config, const char *config_path)
         fprintf (stderr, "error: max_size is not an integer\n");
         return -1;
     }
+    if (json_integer_value (max_size) <= 0)
+    {
+        fprintf (stderr, "error: max_size must be greater than 0\n");
+        return -1;
+    }
+
+
 
     config->query = strdup (json_string_value (query));
     config->frequency = json_integer_value (frequency);
@@ -469,7 +710,8 @@ validate_data (json_t *data, config_data *config, const char *config_path)
 
 /* Tries to setup thread from config file object */
 static int
-initialise_config (json_t *data, const char *config_path)
+initialise_config (json_t *data,
+                   const char *config_path, GHashTable *registry, GPtrArray *configs)
 {
     if (!json_is_object (data))
     {
@@ -477,12 +719,15 @@ initialise_config (json_t *data, const char *config_path)
         return -1;
     }
 
-    config_data *config = malloc (sizeof (config_data));
-    int validation = validate_data (data, config, config_path);
+    config_data *config = calloc (1, sizeof (config_data));
+    g_mutex_init (&config->mutex);
+    g_cond_init (&config->cond);
+
+    int validation = validate_and_set_data (data, config, registry, config_path);
     if (validation != 0)
     {
         fprintf (stderr, "error: bad value in config \n");
-        free (config);
+        config_data_free (config);
         return -1;
     }
 
@@ -490,23 +735,29 @@ initialise_config (json_t *data, const char *config_path)
     if (validation != 0)
     {
         fprintf (stderr, "error: could not start logrotate \n");
-        free (config);
+        config_data_free (config);
         return -1;
     }
 
-    g_thread_new (NULL, thread_func, config);
+    config->initial_delay = calculate_initial_delay_at (config->frequency,
+                                                        read_last_poll_timestamp
+                                                        (config->destination), time (NULL));
+
+    g_ptr_array_add (configs, config);
 
     return 0;
 }
 
-/* Gets all JSON files from specified directory and tries to read them */
+/* Gets all JSON files from specified directory and tries to write data to configs */
 static int
-load_configs_from_directory (const char *config_dir)
+load_configs_from_directory (const char *config_dir,
+                             GHashTable *registry, GPtrArray *configs)
 {
     DIR *dir;
     struct dirent *entry;
     char *ext;
-    char *path;
+    char *path_to_file;
+    char *absolute_config_dir;
     json_t *root;
     json_error_t error;
 
@@ -516,6 +767,8 @@ load_configs_from_directory (const char *config_dir)
         fprintf (stderr, "error: failed to open config directory: %s\n", config_dir);
         return -1;
     }
+
+    absolute_config_dir = resolve_absolute_path (config_dir);
 
     while ((entry = readdir (dir)) != NULL)
     {
@@ -530,32 +783,104 @@ load_configs_from_directory (const char *config_dir)
         {
             continue;
         }
-        path = g_strdup_printf ("%s/%s", config_dir, entry->d_name);
+        path_to_file = g_strdup_printf ("%s/%s", absolute_config_dir, entry->d_name);
 
-        root = json_load_file (path, 0, &error);
+        root = json_load_file (path_to_file, 0, &error);
         if (!root)
         {
-            fprintf (stderr, "error: unable to open file: %s\n", path);
-            g_free (path);
+            fprintf (stderr, "error: unable to open file: %s. May be empty or have too many objects\n", path_to_file);
+            free (absolute_config_dir);
+            g_free (path_to_file);
             closedir (dir);
             return -1;
         }
 
-        if (initialise_config (root, path) != 0)
+        if (initialise_config (root, path_to_file, registry, configs) != 0)
         {
-            fprintf (stderr, "error: failed to initialise config from file: %s\n", path);
+            fprintf (stderr, "error: failed to initialise config from file: %s\n", path_to_file);
+            free (absolute_config_dir);
+            g_free (path_to_file);
             json_decref (root);
-            g_free (path);
             closedir (dir);
             return -1;
         }
 
         json_decref (root);
-        g_free (path);
+        g_free (path_to_file);
     }
 
+    free (absolute_config_dir);
     closedir (dir);
+
+    if (configs->len == 0)
+    {
+        fprintf (stderr, "error: no valid .json config files found in directory: %s\n", config_dir);
+        return -1;
+    }
     return 0;
+}
+
+/* Fills local objects with data from config directory */
+static int
+load_config_set (const char *config_dir, GHashTable **registry, GPtrArray **configs)
+{
+    GHashTable *new_registry = g_hash_table_new_full (g_str_hash,
+                                                      g_str_equal,
+                                                      g_free,
+                                                      g_free);
+    GPtrArray *new_configs = g_ptr_array_new_with_free_func ((GDestroyNotify)
+                                                             config_data_free);
+
+    if (load_configs_from_directory (config_dir, new_registry, new_configs) != 0)
+    {
+        free_config_set (new_registry, new_configs);
+        return -1;
+    }
+
+    *registry = new_registry;
+    *configs = new_configs;
+    return 0;
+}
+
+/* Resets all threads, closing old ones and adding new ones as per config directory info */
+static int
+replace_active_configs (const char *config_dir)
+{
+    GHashTable *new_registry = NULL;
+    GPtrArray *new_configs = NULL;
+
+    if (load_config_set (config_dir, &new_registry, &new_configs) != 0)
+    {
+        return -1;
+    }
+
+    stop_config_set (active_configs);
+    destination_registry_free_all ();
+
+    if (start_config_set (new_configs) != 0)
+    {
+        free_config_set (new_registry, new_configs);
+        return -1;
+    }
+
+    destination_registry = new_registry;
+    active_configs = new_configs;
+
+    return 0;
+}
+
+/* Runs on SIGHUP. Attempts to reload from current config directory */
+static gboolean
+reload_handler (gpointer user_data)
+{
+    const char *config_dir = (const char *) user_data;
+
+    if (replace_active_configs (config_dir) != 0)
+    {
+        fprintf (stderr, "error: failed to reload configs from %s\n", config_dir); // Keeps running with old configs if reload fails
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
 
@@ -787,6 +1112,90 @@ test_compare_json_deep_removed_key_returns_old_value ()
     json_decref (result);
 }
 
+void
+test_calculate_initial_delay_at_missing_timestamp_returns_frequency ()
+{
+    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 0, 100), 30);
+}
+
+void
+test_calculate_initial_delay_at_future_timestamp_returns_frequency ()
+{
+    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 200, 100), 30);
+}
+
+void
+test_calculate_initial_delay_at_overdue_returns_immediate ()
+{
+    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 60, 100), 0);
+}
+
+void
+test_calculate_initial_delay_at_partial_interval_returns_remaining ()
+{
+    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 80, 100), 10);
+}
+
+void
+test_read_last_poll_timestamp_missing_file_returns_zero ()
+{
+    time_t result = read_last_poll_timestamp ("");
+    CU_ASSERT_EQUAL (result, 0);
+}
+
+static int
+write_test_timestamp_file (const char *path_to_diff, json_t *timestamp)
+{
+    json_t *root = json_object ();
+
+    if (timestamp)
+    {
+        json_object_set (root, "timestamp", timestamp);
+    }
+
+    int rc = json_dump_file (root, path_to_diff, 0);
+    json_decref (root);
+    return rc;
+}
+
+void
+test_read_last_poll_timestamp_valid_file_returns_value ()
+{
+    char path[] = "/tmp/recorder_timestamp_valid_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    json_t *timestamp = json_integer (1234);
+
+    CU_ASSERT_EQUAL_FATAL (write_test_timestamp_file (path, timestamp), 0);
+
+    time_t result = read_last_poll_timestamp (path);
+    CU_ASSERT_EQUAL (result, 1234);
+
+    unlink (path);
+    json_decref (timestamp);
+}
+
+void
+test_read_last_poll_timestamp_non_integer_returns_zero ()
+{
+    char path[] = "/tmp/recorder_timestamp_nonint_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    json_t *timestamp = json_string ("bad");
+
+    CU_ASSERT_EQUAL_FATAL (write_test_timestamp_file (path, timestamp), 0);
+
+    time_t result = read_last_poll_timestamp (path);
+    CU_ASSERT_EQUAL (result, 0);
+
+    unlink (path);
+    json_decref (timestamp);
+}
+
 
 int
 main (int argc, char *argv[])
@@ -797,7 +1206,7 @@ main (int argc, char *argv[])
     CU_pSuite pSuite;
     GMainLoop *main_loop = NULL;
 
-    while ((opt = getopt (argc, argv, "huc:")) != -1)
+    while ((opt = getopt (argc, argv, "huc:l::")) != -1)
     {
         switch (opt)
         {
@@ -807,13 +1216,18 @@ main (int argc, char *argv[])
         case 'c':
             config_dir = optarg;
             break;
+        case 'l':
+            logrotate_dir_override = optarg;
+            break;
         case '?':
         case 'h':
         default:
-            printf ("Usage: %s [-h] [-u] [-c <configdir>]\n"
+            printf ("Usage: %s [-h] [-u] [-c <configdir>] [-l <logrotate_dir>]\n"
                     "  -h   show this help\n"
                     "  -u   run unit tests\n"
-                    "  -c   use files from <configdir>\n", argv[0]);
+                    "  -c   use files from <configdir>\n"
+                    "  -l   write logrotate configs to <logrotate_dir> (default: %s)\n",
+                    argv[0], LOGROTATE_DIR_DEFAULT);
             return 0;
         }
     }
@@ -857,6 +1271,22 @@ main (int argc, char *argv[])
         CU_add_test (pSuite, "removed_key_returns_old_value",
                      test_compare_json_deep_removed_key_returns_old_value);
 
+        pSuite = CU_add_suite ("unit::reload_timing", NULL, NULL);
+        CU_add_test (pSuite, "missing_timestamp_returns_frequency",
+                     test_calculate_initial_delay_at_missing_timestamp_returns_frequency);
+        CU_add_test (pSuite, "future_timestamp_returns_frequency",
+                     test_calculate_initial_delay_at_future_timestamp_returns_frequency);
+        CU_add_test (pSuite, "overdue_returns_immediate",
+                     test_calculate_initial_delay_at_overdue_returns_immediate);
+        CU_add_test (pSuite, "partial_interval_returns_remaining",
+                     test_calculate_initial_delay_at_partial_interval_returns_remaining);
+        CU_add_test (pSuite, "missing_file_returns_zero",
+                     test_read_last_poll_timestamp_missing_file_returns_zero);
+        CU_add_test (pSuite, "valid_file_returns_value",
+                     test_read_last_poll_timestamp_valid_file_returns_value);
+        CU_add_test (pSuite, "non_integer_returns_zero",
+                     test_read_last_poll_timestamp_non_integer_returns_zero);
+
         CU_basic_set_mode (CU_BRM_VERBOSE);
         CU_basic_run_tests ();
         int failures = CU_get_number_of_failures ();
@@ -875,12 +1305,17 @@ main (int argc, char *argv[])
 
     apteryx_init (false);
 
-    if (load_configs_from_directory (config_dir) != 0)
+    create_logrotate_include ();
+
+    if (replace_active_configs (config_dir) != 0)
     {
         goto exit;
     }
 
     main_loop = g_main_loop_new (NULL, false);
+    g_unix_signal_add (SIGINT, quit_loop_cb, main_loop);
+    g_unix_signal_add (SIGTERM, quit_loop_cb, main_loop);
+    g_unix_signal_add (SIGHUP, reload_handler, (gpointer) config_dir);
     g_main_loop_run (main_loop);
 
 
@@ -889,6 +1324,9 @@ main (int argc, char *argv[])
     {
         g_main_loop_unref (main_loop);
     }
+
+    /* Stop all running config threads before freeing their data */
+    stop_config_set (active_configs);
 
     /* Cleanup destination registry */
     destination_registry_free_all ();
