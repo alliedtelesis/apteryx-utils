@@ -24,7 +24,7 @@ static const char *logrotate_dir_override = NULL;
 #define LOGROTATE_DIR_DEFAULT "/etc/logrotate-conf.d"
 #define LOGROTATE_INCLUDE_FILE "/etc/logrotate.d/recorder"
 
-static json_t *compare_json_deep (json_t *old_json, json_t *new_json);
+static json_t *compare_json_deep (json_t *current_json, json_t *previous_json);
 
 typedef struct _config_data
 {
@@ -41,6 +41,7 @@ typedef struct _config_data
     GMutex mutex;
     GCond cond;
     gboolean thread_ready;
+    json_t *last_snapshot;
 } config_data;
 
 static GHashTable *destination_registry = NULL;
@@ -99,24 +100,24 @@ make_path (char *path)
 
 /* Compares JSON objects by comparing their individual values */
 static json_t *
-compare_objects (json_t *old_obj, json_t *new_obj)
+compare_objects (json_t *current_obj, json_t *previous_obj)
 {
     json_t *changes = json_object ();
     const char *key;
     json_t *value;
 
-    json_object_foreach (old_obj, key, value)
+    json_object_foreach (current_obj, key, value)
     {
-        json_t *diff = compare_json_deep (value, json_object_get (new_obj, key));
+        json_t *diff = compare_json_deep (value, json_object_get (previous_obj, key));
         if (diff)
         {
             json_object_set_new (changes, key, diff);
         }
     }
 
-    json_object_foreach (new_obj, key, value)
+    json_object_foreach (previous_obj, key, value)
     {
-        if (!json_object_get (old_obj, key))
+        if (!json_object_get (current_obj, key))
         {
             json_object_set_new (changes, key, json_null ());
         }
@@ -130,69 +131,235 @@ compare_objects (json_t *old_obj, json_t *new_obj)
     return changes;
 }
 
-/* Tries to compare primitively, otherwise defers to compare_objects for recursion */
+/* Compares current against previous, returning changed values for use in a forward diff. */
 static json_t *
-compare_json_deep (json_t *old_json, json_t *new_json)
+compare_json_deep (json_t *current_json, json_t *previous_json)
 {
-    if (!old_json && !new_json)
+    if (!current_json && !previous_json)
     {
         return NULL;
     }
-    if (!old_json)
+    if (!current_json)
     {
         return json_null ();
     }
-    if (!new_json)
+    if (!previous_json)
     {
-        return json_incref (old_json);
+        return json_incref (current_json);
     }
 
-    if (json_typeof (old_json) != json_typeof (new_json) ||
-        json_typeof (old_json) != JSON_OBJECT)
+    if (json_typeof (current_json) != json_typeof (previous_json) ||
+        json_typeof (current_json) != JSON_OBJECT)
     {
-        return json_equal (old_json, new_json) ? NULL : json_incref (old_json);
+        return json_equal (current_json, previous_json) ? NULL : json_incref (current_json);
     }
 
-    return compare_objects (old_json, new_json);
+    return compare_objects (current_json, previous_json);
 }
 
-/* Creates, or edits, the JSON diff file */
+
+/* Applies a forward diff to an older snapshot, determining a more recent state */
+static json_t *
+apply_forward_diff (json_t *snapshot, json_t *changes)
+{
+    if (!changes || !json_is_object (changes))
+    {
+        return json_deep_copy (snapshot);
+    }
+
+    json_t *result = json_deep_copy (snapshot);
+    const char *key;
+    json_t *value;
+
+    json_object_foreach (changes, key, value)
+    {
+        if (json_is_null (value))
+        {
+            json_object_del (result, key);
+        }
+        else if (json_is_object (value) && json_is_object (json_object_get (result, key)))
+        {
+            json_t *nested = apply_forward_diff (json_object_get (result, key), value);
+            json_object_set_new (result, key, nested);
+        }
+        else
+        {
+            json_object_set (result, key, value);
+        }
+    }
+
+    return result;
+}
+
+/* Rebuilds the latest snapshot from a baseline + array of forward diffs */
+static json_t *
+reconstruct_latest_snapshot (json_t *baseline, json_t *diffs)
+{
+    json_t *snapshot = json_deep_copy (baseline);
+
+    for (size_t i = 0; i < json_array_size (diffs); i++)
+    {
+        json_t *entry = json_array_get (diffs, i);
+        json_t *changes = json_object_get (entry, "changes");
+        json_t *next = apply_forward_diff (snapshot, changes);
+        json_decref (snapshot);
+        snapshot = next;
+    }
+
+    return snapshot;
+}
+
+/* Appends a single entry to the diffs array via seek, minimising disk write */
 static int
-write_diff (json_t *current_json, const char *path_to_diff)
+append_diff_entry_to_file (const char *path, json_t *diff_entry)
+{
+    FILE *f = fopen (path, "r+");
+    if (!f)
+    {
+        return -1;
+    }
+
+    // Find the last ']' in the file (closing the diffs array)
+    fseek (f, 0, SEEK_END);
+    long file_size = ftell (f);
+    long pos = file_size - 1;
+
+    while (pos >= 0)
+    {
+        fseek (f, pos, SEEK_SET);
+        int ch = fgetc (f);
+        if (ch == ']')
+        {
+            break;
+        }
+        pos--;
+    }
+
+    if (pos < 0)    // No ']' in file. Likely empty.
+    {
+        fclose (f);
+        return -1;
+    }
+
+    long bracket_pos = pos;
+
+    gboolean empty_array = FALSE;
+    pos = bracket_pos - 1;
+    while (pos >= 0)
+    {
+        fseek (f, pos, SEEK_SET);
+        int ch = fgetc (f);
+        if (ch == '[')
+        {
+            empty_array = TRUE;
+            break;
+        }
+        if (!isspace (ch))
+        {
+            break;
+        }
+        pos--;
+    }
+
+    char *entry_str = json_dumps (diff_entry, JSON_COMPACT);
+    if (!entry_str) // Shouldn't happen, but prevents undefined behaviour in fprintf if NULL.
+    {
+        fclose (f);
+        return -1;
+    }
+
+    if (empty_array)
+    {
+        fseek (f, bracket_pos, SEEK_SET);
+        fprintf (f, "\n    %s\n  ]\n  }\n", entry_str);
+    }
+    else
+    {
+        // Scan to find '}' of the previous entry, so the comma trails the previous entry
+        pos = bracket_pos - 1;
+        while (pos >= 0)
+        {
+            fseek (f, pos, SEEK_SET);
+            int ch = fgetc (f);
+            if (ch == '}')
+            {
+                break;
+            }
+            pos--;
+        }
+        fseek (f, pos + 1, SEEK_SET);
+        fprintf (f, ",\n    %s\n  ]\n}\n", entry_str);
+    }
+
+    long new_end = ftell (f);
+    if (ftruncate (fileno (f), new_end) != 0) // Redundant safety net.
+    {
+        free (entry_str);
+        fclose (f);
+        return -1;
+    }
+
+    free (entry_str);
+    fclose (f);
+    return 0;
+}
+
+/* Edits (or creates) JSON diff file. Uses an in-memory cache to optimise calculations */
+static int
+write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
 {
     int error_code;
     json_error_t error;
     json_t *storage = json_load_file (path_to_diff, 0, &error);
 
-    if (!storage)
+    if (!*last_snapshot_cache || !storage)
     {
-        json_t *new_storage = json_object ();
-        json_object_set_new (new_storage, "timestamp", json_integer (time (NULL)));
-        json_object_set_new (new_storage, "current", json_deep_copy (current_json));
+        if (storage)
+        {
+            // Reconstruct latest state from existing file. Likely a SIGHUP reload
+            json_t *baseline = json_object_get (storage, "baseline");
+            json_t *diffs = json_object_get (storage, "diffs");
+            *last_snapshot_cache = reconstruct_latest_snapshot (baseline, diffs);
+            json_decref (storage);
+            storage = NULL;
+        }
+        else
+        {
+            // No existing file: write baseline and set cache to current state
+            json_t *new_storage = json_object ();
+            json_object_set_new (new_storage, "baseline_timestamp",
+                                 json_integer (time (NULL)));
+            json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
+            json_object_set_new (new_storage, "diffs", json_array ());
 
-        json_t *diffs_array = json_array ();
-        json_object_set_new (new_storage, "diffs", diffs_array);
+            error_code = json_dump_file (new_storage, path_to_diff,
+                                         JSON_INDENT (json_indent));
+            json_decref (new_storage);
 
-        error_code = json_dump_file (new_storage, path_to_diff, JSON_INDENT (json_indent));
-        json_decref (new_storage);
-
-        return error_code;
+            *last_snapshot_cache = json_deep_copy (current_json);
+            return error_code;
+        }
     }
 
-    json_t *changes =
-        compare_json_deep (json_object_get (storage, "current"), current_json);
-    json_t *diff = json_object ();
+    json_t *changes = compare_json_deep (current_json, *last_snapshot_cache);
 
-    json_object_set_new (diff, "timestamp",
-                         json_deep_copy (json_object_get (storage, "timestamp")));
-    json_object_set_new (diff, "changes", changes ? changes : json_object ());
+    json_t *diff_entry = json_object ();
+    json_object_set_new (diff_entry, "timestamp", json_integer (time (NULL)));
+    json_object_set_new (diff_entry, "changes", changes ? changes : json_object ());
 
-    json_array_insert_new (json_object_get (storage, "diffs"), 0, diff);
-    json_object_set_new (storage, "timestamp", json_integer (time (NULL)));
-    json_object_set_new (storage, "current", json_deep_copy (current_json));
+    error_code = append_diff_entry_to_file (path_to_diff, diff_entry);
+    json_decref (diff_entry);
 
-    error_code = json_dump_file (storage, path_to_diff, JSON_INDENT (json_indent));
-    json_decref (storage);
+    if (error_code == 0 && changes != NULL) // Only update if there were valid changes
+    {
+        json_decref (*last_snapshot_cache);
+        *last_snapshot_cache = json_deep_copy (current_json);
+    }
+
+    if (storage)
+    {
+        json_decref (storage);
+    }
 
     return error_code;
 }
@@ -286,7 +453,7 @@ create_logrotate_config (config_data *config)
     int n = snprintf (NULL, 0, "%s/%s", out_dir, config_name);
     char *config_path = malloc (n + 1);
     snprintf (config_path, n + 1, "%s/%s", out_dir, config_name);
-    
+
     char *directory_to_write = strdup (config_path);
     if (make_path (directory_to_write) != 0)
     {
@@ -339,16 +506,16 @@ polling_callback (gpointer user_data)
 
     if (!json_from_tree)
     {
-        fprintf (stderr, "error: could not fetch JSON from query: %s\n", config->query);
+        fprintf (stderr, "warning: could not fetch JSON from query: %s\n", config->query);
         return G_SOURCE_CONTINUE;   // Continues in case it is a temporary apteryx issue
     }
 
-    if (write_diff (json_from_tree, config->destination) != 0)
+    if (write_diff (json_from_tree, config->destination, &config->last_snapshot) != 0)
     {
         fprintf (stderr, "error: could not write diff. Check destination: %s\n",
                  config->destination);
         json_decref (json_from_tree);
-        return G_SOURCE_REMOVE; // Breaks as the destination has likely been removed
+        return G_SOURCE_REMOVE; // Breaks as the destination is likely significantly broken
     }
 
     json_decref (json_from_tree);
@@ -401,7 +568,8 @@ calculate_initial_delay_at (long frequency, time_t last_poll_timestamp, time_t n
     return (guint) (frequency - elapsed);
 }
 
-/* Determines when the last poll was */
+/* Determines when the last poll was.
+ * Reads the timestamp from the last diff entry, or the baseline if no diffs exist. */
 static time_t
 read_last_poll_timestamp (const char *path_to_diff)
 {
@@ -412,9 +580,20 @@ read_last_poll_timestamp (const char *path_to_diff)
         return 0;
     }
 
-    json_t *timestamp = json_object_get (storage, "timestamp");
-    time_t result = json_is_integer (timestamp) ?
-        (time_t) json_integer_value (timestamp) : 0;
+    json_t *diffs = json_object_get (storage, "diffs");
+    size_t diffs_len = json_is_array (diffs) ? json_array_size (diffs) : 0;
+
+    if (diffs_len > 0)
+    {
+        json_t *last_diff = json_array_get (diffs, diffs_len - 1);
+        json_t *ts = json_object_get (last_diff, "timestamp");
+        time_t result = json_is_integer (ts) ? (time_t) json_integer_value (ts) : 0;
+        json_decref (storage);
+        return result;
+    }
+
+    json_t *ts = json_object_get (storage, "baseline_timestamp");
+    time_t result = json_is_integer (ts) ? (time_t) json_integer_value (ts) : 0;
 
     json_decref (storage);
     return result;
@@ -471,6 +650,10 @@ config_data_free (config_data *config)
     {
         free (config->query);
         free (config->destination);
+        if (config->last_snapshot)
+        {
+            json_decref (config->last_snapshot);
+        }
         g_mutex_clear (&config->mutex);
         g_cond_clear (&config->cond);
         free (config);
@@ -638,7 +821,7 @@ validate_destination (GHashTable *registry,
 /* Validates the data provided in the config file. Mostly checks types */
 static int
 validate_and_set_data (json_t *data,
-               config_data *config, GHashTable *registry, const char *config_path)
+                       config_data *config, GHashTable *registry, const char *config_path)
 {
     json_t *query, *frequency, *destination, *max_samples, *max_size;
 
@@ -667,7 +850,6 @@ validate_and_set_data (json_t *data,
         fprintf (stderr, "error: destination is not a string\n");
         return -1;
     }
-
     if (validate_destination (registry, json_string_value (destination), config_path) != 0)
     {
         return -1;
@@ -734,7 +916,7 @@ initialise_config (json_t *data,
     validation = create_logrotate_config (config);
     if (validation != 0)
     {
-        fprintf (stderr, "error: could not start logrotate \n");
+        fprintf (stderr, "error: could not start logrotate. Check permissions \n");
         config_data_free (config);
         return -1;
     }
@@ -788,7 +970,9 @@ load_configs_from_directory (const char *config_dir,
         root = json_load_file (path_to_file, 0, &error);
         if (!root)
         {
-            fprintf (stderr, "error: unable to open file: %s. May be empty or have too many objects\n", path_to_file);
+            fprintf (stderr,
+                     "error: unable to open file: %s. May be empty or have too many objects\n",
+                     path_to_file);
             free (absolute_config_dir);
             g_free (path_to_file);
             closedir (dir);
@@ -797,7 +981,8 @@ load_configs_from_directory (const char *config_dir,
 
         if (initialise_config (root, path_to_file, registry, configs) != 0)
         {
-            fprintf (stderr, "error: failed to initialise config from file: %s\n", path_to_file);
+            fprintf (stderr, "error: failed to initialise config from file: %s\n",
+                     path_to_file);
             free (absolute_config_dir);
             g_free (path_to_file);
             json_decref (root);
@@ -814,7 +999,8 @@ load_configs_from_directory (const char *config_dir,
 
     if (configs->len == 0)
     {
-        fprintf (stderr, "error: no valid .json config files found in directory: %s\n", config_dir);
+        fprintf (stderr, "error: no valid .json config files found in directory: %s\n",
+                 config_dir);
         return -1;
     }
     return 0;
@@ -877,7 +1063,7 @@ reload_handler (gpointer user_data)
 
     if (replace_active_configs (config_dir) != 0)
     {
-        fprintf (stderr, "error: failed to reload configs from %s\n", config_dir); // Keeps running with old configs if reload fails
+        fprintf (stderr, "error: failed to reload configs from %s\n", config_dir);  // Keeps running with old configs if reload fails
     }
 
     return G_SOURCE_CONTINUE;
@@ -892,192 +1078,188 @@ test_compare_json_deep_both_null_returns_null ()
 }
 
 void
-test_compare_json_deep_old_null_returns_json_null ()
+test_compare_json_deep_current_null_returns_json_null ()
 {
-    json_t *new_json = json_object ();
-    json_t *result = compare_json_deep (NULL, new_json);
+    json_t *previous_json = json_object ();
+    json_t *result = compare_json_deep (NULL, previous_json);
     json_t *expected = json_null ();
 
     CU_ASSERT_EQUAL (result, expected);
 
-    json_decref (new_json);
+    json_decref (previous_json);
     json_decref (result);
     json_decref (expected);
 }
 
 void
-test_compare_json_deep_new_null_returns_old_value ()
+test_compare_json_deep_previous_null_returns_current_value ()
 {
-    json_t *old_json = json_object ();
-    json_t *result = compare_json_deep (old_json, NULL);
+    json_t *current_json = json_object ();
+    json_t *result = compare_json_deep (current_json, NULL);
 
-    CU_ASSERT_PTR_EQUAL (result, old_json);
+    CU_ASSERT_PTR_EQUAL (result, current_json);
 
-    json_decref (old_json);
+    json_decref (current_json);
     json_decref (result);
 }
 
 void
-test_compare_json_deep_type_mismatch_returns_old_value ()
+test_compare_json_deep_type_mismatch_returns_current_value ()
 {
-    json_t *old_json = json_object ();
-    json_t *new_json = json_string ("new value");
-    json_t *result = compare_json_deep (old_json, new_json);
+    json_t *current_json = json_object ();
+    json_t *previous_json = json_string ("previous value");
+    json_t *result = compare_json_deep (current_json, previous_json);
 
-    CU_ASSERT_PTR_EQUAL (result, old_json);
+    CU_ASSERT_PTR_EQUAL (result, current_json);
 
-    json_decref (old_json);
-    json_decref (new_json);
+    json_decref (current_json);
+    json_decref (previous_json);
     json_decref (result);
 }
 
 void
 test_compare_json_deep_equal_string_returns_null ()
 {
-    json_t *old_json = json_string ("value");
-    json_t *new_json = json_string ("value");
-    json_t *result = compare_json_deep (old_json, new_json);
+    json_t *current_json = json_string ("value");
+    json_t *previous_json = json_string ("value");
+    json_t *result = compare_json_deep (current_json, previous_json);
 
     CU_ASSERT_PTR_NULL (result);
 
-    json_decref (old_json);
-    json_decref (new_json);
+    json_decref (current_json);
+    json_decref (previous_json);
 }
 
 void
 test_compare_json_deep_equal_integer_returns_null ()
 {
-    json_t *old_json = json_integer (42);
-    json_t *new_json = json_integer (42);
-    json_t *result = compare_json_deep (old_json, new_json);
+    json_t *current_json = json_integer (42);
+    json_t *previous_json = json_integer (42);
+    json_t *result = compare_json_deep (current_json, previous_json);
 
     CU_ASSERT_PTR_NULL (result);
 
-    json_decref (old_json);
-    json_decref (new_json);
+    json_decref (current_json);
+    json_decref (previous_json);
 }
 
 void
-test_compare_json_deep_different_string_returns_old_value ()
+test_compare_json_deep_different_string_returns_current_value ()
 {
-    json_t *old_json = json_string ("value");
-    json_t *new_json = json_string ("new value");
-    json_t *result = compare_json_deep (old_json, new_json);
+    json_t *current_json = json_string ("new value");
+    json_t *previous_json = json_string ("old value");
+    json_t *result = compare_json_deep (current_json, previous_json);
 
-    CU_ASSERT_PTR_EQUAL (result, old_json);
+    CU_ASSERT_PTR_EQUAL (result, current_json);
 
-    json_decref (old_json);
-    json_decref (new_json);
+    json_decref (current_json);
+    json_decref (previous_json);
     json_decref (result);
 }
 
 void
-test_compare_json_deep_different_integer_returns_old_value ()
+test_compare_json_deep_different_integer_returns_current_value ()
 {
-    json_t *old_json = json_integer (42);
-    json_t *new_json = json_integer (41);
-    json_t *result = compare_json_deep (old_json, new_json);
+    json_t *current_json = json_integer (42);
+    json_t *previous_json = json_integer (41);
+    json_t *result = compare_json_deep (current_json, previous_json);
 
-    CU_ASSERT_PTR_EQUAL (result, old_json);
+    CU_ASSERT_PTR_EQUAL (result, current_json);
 
-    json_decref (old_json);
-    json_decref (new_json);
+    json_decref (current_json);
+    json_decref (previous_json);
     json_decref (result);
 }
-
 
 void
 test_compare_json_deep_equal_arrays_returns_null ()
 {
-    json_t *old_arr = json_array ();
-    json_array_append_new (old_arr, json_integer (1));
-    json_array_append_new (old_arr, json_integer (2));
-    json_t *new_arr = json_array ();
-    json_array_append_new (new_arr, json_integer (1));
-    json_array_append_new (new_arr, json_integer (2));
-    json_t *result = compare_json_deep (old_arr, new_arr);
+    json_t *current_arr = json_array ();
+    json_array_append_new (current_arr, json_integer (1));
+    json_array_append_new (current_arr, json_integer (2));
+    json_t *previous_arr = json_array ();
+    json_array_append_new (previous_arr, json_integer (1));
+    json_array_append_new (previous_arr, json_integer (2));
+    json_t *result = compare_json_deep (current_arr, previous_arr);
 
     CU_ASSERT_PTR_NULL (result);
 
-    json_decref (old_arr);
-    json_decref (new_arr);
+    json_decref (current_arr);
+    json_decref (previous_arr);
 }
 
 void
-test_compare_json_deep_different_arrays_returns_old_array ()
+test_compare_json_deep_different_arrays_returns_current_array ()
 {
-    json_t *old_arr = json_array ();
-    json_array_append_new (old_arr, json_integer (1));
-    json_array_append_new (old_arr, json_integer (2));
-    json_t *new_arr = json_array ();
-    json_array_append_new (new_arr, json_integer (1));
-    json_array_append_new (new_arr, json_integer (2));
-    json_array_append_new (new_arr, json_integer (3));
-    json_t *result = compare_json_deep (old_arr, new_arr);
+    json_t *current_arr = json_array ();
+    json_array_append_new (current_arr, json_integer (1));
+    json_array_append_new (current_arr, json_integer (2));
+    json_array_append_new (current_arr, json_integer (3));
+    json_t *previous_arr = json_array ();
+    json_array_append_new (previous_arr, json_integer (1));
+    json_array_append_new (previous_arr, json_integer (2));
+    json_t *result = compare_json_deep (current_arr, previous_arr);
 
-    CU_ASSERT_PTR_EQUAL (result, old_arr);
+    CU_ASSERT_PTR_EQUAL (result, current_arr);
 
-    json_decref (old_arr);
-    json_decref (new_arr);
+    json_decref (current_arr);
+    json_decref (previous_arr);
     json_decref (result);
 }
-
 
 void
 test_compare_json_deep_empty_objects_returns_null ()
 {
-    json_t *old_obj = json_object ();
-    json_t *new_obj = json_object ();
-    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *current_obj = json_object ();
+    json_t *previous_obj = json_object ();
+    json_t *result = compare_json_deep (current_obj, previous_obj);
 
     CU_ASSERT_PTR_NULL (result);
 
-    json_decref (old_obj);
-    json_decref (new_obj);
+    json_decref (current_obj);
+    json_decref (previous_obj);
 }
 
 void
 test_compare_json_deep_equal_object_values_returns_null ()
 {
-    json_t *old_obj = json_object ();
-    json_t *new_obj = json_object ();
-    json_object_set_new (old_obj, "key1", json_string ("value"));
-    json_object_set_new (new_obj, "key1", json_string ("value"));
-    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *current_obj = json_object ();
+    json_t *previous_obj = json_object ();
+    json_object_set_new (current_obj, "key1", json_string ("value"));
+    json_object_set_new (previous_obj, "key1", json_string ("value"));
+    json_t *result = compare_json_deep (current_obj, previous_obj);
 
     CU_ASSERT_PTR_NULL (result);
 
-    json_decref (old_obj);
-    json_decref (new_obj);
+    json_decref (current_obj);
+    json_decref (previous_obj);
 }
 
-
 void
-test_compare_json_deep_changed_object_value_returns_old_value_object ()
+test_compare_json_deep_changed_object_value_returns_current_value_object ()
 {
-    json_t *old_obj = json_object ();
-    json_t *new_obj = json_object ();
-    json_object_set_new (old_obj, "key1", json_string ("value"));
-    json_object_set_new (new_obj, "key1", json_string ("new value"));
-    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *current_obj = json_object ();
+    json_t *previous_obj = json_object ();
+    json_object_set_new (current_obj, "key1", json_string ("new value"));
+    json_object_set_new (previous_obj, "key1", json_string ("old value"));
+    json_t *result = compare_json_deep (current_obj, previous_obj);
 
     CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
-    CU_ASSERT_TRUE (json_equal (result, old_obj));
+    CU_ASSERT_TRUE (json_equal (result, current_obj));
 
-    json_decref (old_obj);
-    json_decref (new_obj);
+    json_decref (current_obj);
+    json_decref (previous_obj);
     json_decref (result);
 }
 
-
 void
-test_compare_json_deep_added_key_returns_json_null_marker ()
+test_compare_json_deep_deleted_key_records_null_marker ()
 {
-    json_t *old_obj = json_object ();
-    json_t *new_obj = json_object ();
-    json_object_set_new (new_obj, "key1", json_string ("value"));
+    json_t *current_obj = json_object ();
+    json_t *previous_obj = json_object ();
+    json_object_set_new (previous_obj, "key1", json_string ("value"));
 
-    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *result = compare_json_deep (current_obj, previous_obj);
     json_t *diff = json_object_get (result, "key1");
     json_t *expected_null = json_null ();
 
@@ -1085,21 +1267,21 @@ test_compare_json_deep_added_key_returns_json_null_marker ()
     CU_ASSERT_EQUAL (diff, expected_null);
 
     json_decref (expected_null);
-    json_decref (old_obj);
-    json_decref (new_obj);
+    json_decref (current_obj);
+    json_decref (previous_obj);
     json_decref (result);
 }
 
 void
-test_compare_json_deep_removed_key_returns_old_value ()
+test_compare_json_deep_new_key_returns_current_value ()
 {
-    json_t *old_obj = json_object ();
-    json_t *new_obj = json_object ();
-    json_object_set_new (old_obj, "key1", json_string ("value"));
-    json_object_set_new (old_obj, "key2", json_string ("new value"));
-    json_object_set_new (new_obj, "key1", json_string ("value"));
+    json_t *current_obj = json_object ();
+    json_t *previous_obj = json_object ();
+    json_object_set_new (current_obj, "key1", json_string ("value"));
+    json_object_set_new (current_obj, "key2", json_string ("new value"));
+    json_object_set_new (previous_obj, "key1", json_string ("value"));
 
-    json_t *result = compare_json_deep (old_obj, new_obj);
+    json_t *result = compare_json_deep (current_obj, previous_obj);
     json_t *diff = json_object_get (result, "key2");
     json_t *expected = json_string ("new value");
 
@@ -1107,10 +1289,11 @@ test_compare_json_deep_removed_key_returns_old_value ()
     CU_ASSERT_TRUE (json_equal (diff, expected));
 
     json_decref (expected);
-    json_decref (old_obj);
-    json_decref (new_obj);
+    json_decref (current_obj);
+    json_decref (previous_obj);
     json_decref (result);
 }
+
 
 void
 test_calculate_initial_delay_at_missing_timestamp_returns_frequency ()
@@ -1150,8 +1333,11 @@ write_test_timestamp_file (const char *path_to_diff, json_t *timestamp)
 
     if (timestamp)
     {
-        json_object_set (root, "timestamp", timestamp);
+        json_object_set (root, "baseline_timestamp", timestamp);
     }
+
+    json_object_set_new (root, "baseline", json_object ());
+    json_object_set_new (root, "diffs", json_array ());
 
     int rc = json_dump_file (root, path_to_diff, 0);
     json_decref (root);
@@ -1194,6 +1380,547 @@ test_read_last_poll_timestamp_non_integer_returns_zero ()
 
     unlink (path);
     json_decref (timestamp);
+}
+
+
+void
+test_apply_forward_diff_null_changes_returns_copy ()
+{
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("val"));
+
+    json_t *result = apply_forward_diff (snapshot, NULL);
+
+    CU_ASSERT_TRUE (json_equal (result, snapshot));
+    CU_ASSERT_PTR_NOT_EQUAL (result, snapshot);
+
+    json_decref (snapshot);
+    json_decref (result);
+}
+
+void
+test_apply_forward_diff_empty_changes_returns_copy ()
+{
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("val"));
+    json_t *changes = json_object ();
+
+    json_t *result = apply_forward_diff (snapshot, changes);
+
+    CU_ASSERT_TRUE (json_equal (result, snapshot));
+    CU_ASSERT_PTR_NOT_EQUAL (result, snapshot);
+
+    json_decref (snapshot);
+    json_decref (changes);
+    json_decref (result);
+}
+
+void
+test_apply_forward_diff_updates_existing_key ()
+{
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("old"));
+    json_t *changes = json_object ();
+    json_object_set_new (changes, "key", json_string ("new"));
+
+    json_t *result = apply_forward_diff (snapshot, changes);
+    json_t *expected = json_string ("new");
+
+    CU_ASSERT_TRUE (json_equal (json_object_get (result, "key"), expected));
+
+    json_decref (snapshot);
+    json_decref (changes);
+    json_decref (result);
+    json_decref (expected);
+}
+
+void
+test_apply_forward_diff_adds_new_key ()
+{
+    json_t *snapshot = json_object ();
+    json_t *changes = json_object ();
+    json_object_set_new (changes, "added", json_string ("value"));
+
+    json_t *result = apply_forward_diff (snapshot, changes);
+
+    CU_ASSERT_PTR_NOT_NULL (json_object_get (result, "added"));
+    CU_ASSERT_TRUE (json_equal (json_object_get (result, "added"),
+                                json_object_get (changes, "added")));
+
+    json_decref (snapshot);
+    json_decref (changes);
+    json_decref (result);
+}
+
+void
+test_apply_forward_diff_null_value_deletes_key ()
+{
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("val"));
+    json_t *changes = json_object ();
+    json_object_set_new (changes, "key", json_null ());
+
+    json_t *result = apply_forward_diff (snapshot, changes);
+
+    CU_ASSERT_PTR_NULL (json_object_get (result, "key"));
+    CU_ASSERT_EQUAL (json_object_size (result), 0);
+
+    json_decref (snapshot);
+    json_decref (changes);
+    json_decref (result);
+}
+
+void
+test_apply_forward_diff_nested_object_merges ()
+{
+    json_t *inner = json_object ();
+    json_object_set_new (inner, "a", json_string ("1"));
+    json_object_set_new (inner, "b", json_string ("2"));
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "nested", inner);
+
+    json_t *inner_change = json_object ();
+    json_object_set_new (inner_change, "b", json_string ("changed"));
+    json_t *changes = json_object ();
+    json_object_set_new (changes, "nested", inner_change);
+
+    json_t *result = apply_forward_diff (snapshot, changes);
+    json_t *result_nested = json_object_get (result, "nested");
+
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result_nested, "a")), "1");
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result_nested, "b")),
+                            "changed");
+
+    json_decref (snapshot);
+    json_decref (changes);
+    json_decref (result);
+}
+
+
+void
+test_reconstruct_no_diffs_returns_baseline ()
+{
+    json_t *baseline = json_object ();
+    json_object_set_new (baseline, "key", json_string ("val"));
+    json_t *diffs = json_array ();
+
+    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
+
+    CU_ASSERT_TRUE (json_equal (result, baseline));
+    CU_ASSERT_PTR_NOT_EQUAL (result, baseline);
+
+    json_decref (baseline);
+    json_decref (diffs);
+    json_decref (result);
+}
+
+void
+test_reconstruct_single_diff_applies ()
+{
+    json_t *baseline = json_object ();
+    json_object_set_new (baseline, "key", json_string ("v1"));
+
+    json_t *diff_changes = json_object ();
+    json_object_set_new (diff_changes, "key", json_string ("v2"));
+    json_t *diff_entry = json_object ();
+    json_object_set_new (diff_entry, "changes", diff_changes);
+
+    json_t *diffs = json_array ();
+    json_array_append_new (diffs, diff_entry);
+
+    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
+    json_t *expected = json_string ("v2");
+
+    CU_ASSERT_TRUE (json_equal (json_object_get (result, "key"), expected));
+
+    json_decref (baseline);
+    json_decref (diffs);
+    json_decref (result);
+    json_decref (expected);
+}
+
+void
+test_reconstruct_multiple_diffs_applies_in_order ()
+{
+    json_t *baseline = json_object ();
+    json_object_set_new (baseline, "key", json_string ("v1"));
+
+    json_t *d1_changes = json_object ();
+    json_object_set_new (d1_changes, "key", json_string ("v2"));
+    json_t *d1 = json_object ();
+    json_object_set_new (d1, "changes", d1_changes);
+
+    json_t *d2_changes = json_object ();
+    json_object_set_new (d2_changes, "key", json_string ("v3"));
+    json_t *d2 = json_object ();
+    json_object_set_new (d2, "changes", d2_changes);
+
+    json_t *diffs = json_array ();
+    json_array_append_new (diffs, d1);
+    json_array_append_new (diffs, d2);
+
+    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
+
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result, "key")), "v3");
+
+    json_decref (baseline);
+    json_decref (diffs);
+    json_decref (result);
+}
+
+void
+test_reconstruct_diff_with_deletion ()
+{
+    json_t *baseline = json_object ();
+    json_object_set_new (baseline, "a", json_string ("1"));
+    json_object_set_new (baseline, "b", json_string ("2"));
+
+    json_t *changes = json_object ();
+    json_object_set_new (changes, "b", json_null ());
+    json_t *d = json_object ();
+    json_object_set_new (d, "changes", changes);
+
+    json_t *diffs = json_array ();
+    json_array_append_new (diffs, d);
+
+    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
+
+    CU_ASSERT_PTR_NOT_NULL (json_object_get (result, "a"));
+    CU_ASSERT_PTR_NULL (json_object_get (result, "b"));
+
+    json_decref (baseline);
+    json_decref (diffs);
+    json_decref (result);
+}
+
+
+void
+test_append_diff_to_empty_array ()
+{
+    char path[] = "/tmp/recorder_append_empty_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    /* Write a minimal valid file with empty diffs array */
+    json_t *storage = json_object ();
+    json_object_set_new (storage, "baseline_timestamp", json_integer (100));
+    json_object_set_new (storage, "baseline", json_object ());
+    json_object_set_new (storage, "diffs", json_array ());
+    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
+    json_decref (storage);
+
+    json_t *entry = json_object ();
+    json_object_set_new (entry, "timestamp", json_integer (200));
+    json_object_set_new (entry, "changes", json_object ());
+
+    CU_ASSERT_EQUAL (append_diff_entry_to_file (path, entry), 0);
+    json_decref (entry);
+
+    /* Verify the file is still valid JSON with one diff */
+    json_error_t error;
+    json_t *reloaded = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (reloaded);
+
+    json_t *diffs = json_object_get (reloaded, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
+    CU_ASSERT_EQUAL (json_integer_value
+                     (json_object_get (json_array_get (diffs, 0), "timestamp")), 200);
+
+    json_decref (reloaded);
+    unlink (path);
+}
+
+void
+test_append_diff_to_nonempty_array ()
+{
+    char path[] = "/tmp/recorder_append_nonempty_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    /* Write file with one existing diff */
+    json_t *existing_entry = json_object ();
+    json_object_set_new (existing_entry, "timestamp", json_integer (100));
+    json_object_set_new (existing_entry, "changes", json_object ());
+    json_t *diffs_arr = json_array ();
+    json_array_append_new (diffs_arr, existing_entry);
+
+    json_t *storage = json_object ();
+    json_object_set_new (storage, "baseline_timestamp", json_integer (50));
+    json_object_set_new (storage, "baseline", json_object ());
+    json_object_set_new (storage, "diffs", diffs_arr);
+    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
+    json_decref (storage);
+
+    json_t *entry = json_object ();
+    json_object_set_new (entry, "timestamp", json_integer (200));
+    json_object_set_new (entry, "changes", json_object ());
+
+    CU_ASSERT_EQUAL (append_diff_entry_to_file (path, entry), 0);
+    json_decref (entry);
+
+    json_error_t error;
+    json_t *reloaded = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (reloaded);
+
+    json_t *diffs = json_object_get (reloaded, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 2);
+    CU_ASSERT_EQUAL (json_integer_value
+                     (json_object_get (json_array_get (diffs, 0), "timestamp")), 100);
+    CU_ASSERT_EQUAL (json_integer_value
+                     (json_object_get (json_array_get (diffs, 1), "timestamp")), 200);
+
+    json_decref (reloaded);
+    unlink (path);
+}
+
+void
+test_append_diff_nonexistent_file_fails ()
+{
+    json_t *entry = json_object ();
+    json_object_set_new (entry, "timestamp", json_integer (100));
+    json_object_set_new (entry, "changes", json_object ());
+
+    CU_ASSERT_NOT_EQUAL (append_diff_entry_to_file
+                         ("/tmp/recorder_nonexistent_file_xyz", entry), 0);
+
+    json_decref (entry);
+}
+
+
+void
+test_write_diff_creates_baseline_on_new_file ()
+{
+    char path[] = "/tmp/recorder_wd_new_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);  /* Ensure file does not exist */
+
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("val"));
+    json_t *cache = NULL;
+
+    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
+    CU_ASSERT_PTR_NOT_NULL (cache);
+
+    /* Verify file structure */
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+    CU_ASSERT_PTR_NOT_NULL (json_object_get (storage, "baseline"));
+    CU_ASSERT_PTR_NOT_NULL (json_object_get (storage, "baseline_timestamp"));
+    CU_ASSERT_TRUE (json_equal (json_object_get (storage, "baseline"), snapshot));
+    CU_ASSERT_EQUAL (json_array_size (json_object_get (storage, "diffs")), 0);
+
+    json_decref (storage);
+    json_decref (snapshot);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
+test_write_diff_appends_empty_diff_when_unchanged ()
+{
+    char path[] = "/tmp/recorder_wd_unchanged_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *snapshot = json_object ();
+    json_object_set_new (snapshot, "key", json_string ("val"));
+    json_t *cache = NULL;
+
+    /* First call creates baseline */
+    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
+    /* Second call with same data */
+    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
+
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    json_t *diffs = json_object_get (storage, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
+
+    /* Changes should be empty object */
+    json_t *first_diff = json_array_get (diffs, 0);
+    json_t *changes = json_object_get (first_diff, "changes");
+    CU_ASSERT_EQUAL (json_object_size (changes), 0);
+
+    json_decref (storage);
+    json_decref (snapshot);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
+test_write_diff_records_changes ()
+{
+    char path[] = "/tmp/recorder_wd_changes_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *snap1 = json_object ();
+    json_object_set_new (snap1, "key", json_string ("v1"));
+    json_t *cache = NULL;
+
+    CU_ASSERT_EQUAL (write_diff (snap1, path, &cache), 0);
+
+    json_t *snap2 = json_object ();
+    json_object_set_new (snap2, "key", json_string ("v2"));
+
+    CU_ASSERT_EQUAL (write_diff (snap2, path, &cache), 0);
+
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    /* Baseline should still be v1 */
+    CU_ASSERT_STRING_EQUAL (json_string_value
+                            (json_object_get
+                             (json_object_get (storage, "baseline"), "key")), "v1");
+
+    /* Diff should record the new value v2 */
+    json_t *diffs = json_object_get (storage, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
+    json_t *changes = json_object_get (json_array_get (diffs, 0), "changes");
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (changes, "key")), "v2");
+
+    json_decref (storage);
+    json_decref (snap1);
+    json_decref (snap2);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
+test_write_diff_multiple_polls_accumulates_diffs ()
+{
+    char path[] = "/tmp/recorder_wd_multi_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *cache = NULL;
+
+    json_t *s1 = json_object ();
+    json_object_set_new (s1, "key", json_string ("v1"));
+    CU_ASSERT_EQUAL (write_diff (s1, path, &cache), 0);
+
+    json_t *s2 = json_object ();
+    json_object_set_new (s2, "key", json_string ("v2"));
+    CU_ASSERT_EQUAL (write_diff (s2, path, &cache), 0);
+
+    json_t *s3 = json_object ();
+    json_object_set_new (s3, "key", json_string ("v3"));
+    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
+
+    /* Same as s3 - empty diff */
+    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
+
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    json_t *diffs = json_object_get (storage, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 3);
+
+    /* Verify baseline untouched */
+    CU_ASSERT_STRING_EQUAL (json_string_value
+                            (json_object_get
+                             (json_object_get (storage, "baseline"), "key")), "v1");
+
+    json_decref (storage);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
+test_write_diff_reconstruct_from_existing_file ()
+{
+    char path[] = "/tmp/recorder_wd_recon_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    /* Simulate first session: write baseline + one diff */
+    json_t *cache1 = NULL;
+    json_t *s1 = json_object ();
+    json_object_set_new (s1, "key", json_string ("v1"));
+    CU_ASSERT_EQUAL (write_diff (s1, path, &cache1), 0);
+
+    json_t *s2 = json_object ();
+    json_object_set_new (s2, "key", json_string ("v2"));
+    CU_ASSERT_EQUAL (write_diff (s2, path, &cache1), 0);
+    json_decref (cache1);
+
+    /* Simulate restart: new cache, same file */
+    json_t *cache2 = NULL;
+    json_t *s3 = json_object ();
+    json_object_set_new (s3, "key", json_string ("v3"));
+    CU_ASSERT_EQUAL (write_diff (s3, path, &cache2), 0);
+
+    /* Verify: baseline=v1, diffs=[v2_change, v3_change] */
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    CU_ASSERT_STRING_EQUAL (json_string_value
+                            (json_object_get
+                             (json_object_get (storage, "baseline"), "key")), "v1");
+
+    json_t *diffs = json_object_get (storage, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 2);
+
+    /* The second diff should have v3 as the new value */
+    json_t *last_changes = json_object_get (json_array_get (diffs, 1), "changes");
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (last_changes, "key")),
+                            "v3");
+
+    json_decref (storage);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    json_decref (cache2);
+    unlink (path);
+}
+
+void
+test_read_last_poll_timestamp_reads_from_diffs ()
+{
+    char path[] = "/tmp/recorder_ts_diffs_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    /* Write file with a diff entry that has a known timestamp */
+    json_t *diff_entry = json_object ();
+    json_object_set_new (diff_entry, "timestamp", json_integer (9999));
+    json_object_set_new (diff_entry, "changes", json_object ());
+    json_t *diffs_arr = json_array ();
+    json_array_append_new (diffs_arr, diff_entry);
+
+    json_t *storage = json_object ();
+    json_object_set_new (storage, "baseline_timestamp", json_integer (1000));
+    json_object_set_new (storage, "baseline", json_object ());
+    json_object_set_new (storage, "diffs", diffs_arr);
+    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, 0), 0);
+    json_decref (storage);
+
+    time_t result = read_last_poll_timestamp (path);
+    CU_ASSERT_EQUAL (result, 9999);
+
+    unlink (path);
 }
 
 
@@ -1240,36 +1967,36 @@ main (int argc, char *argv[])
         pSuite = CU_add_suite ("unit::compare_json_deep", NULL, NULL);
         CU_add_test (pSuite, "both_null_returns_null",
                      test_compare_json_deep_both_null_returns_null);
-        CU_add_test (pSuite, "old_null_returns_json_null",
-                     test_compare_json_deep_old_null_returns_json_null);
-        CU_add_test (pSuite, "new_null_returns_old_value",
-                     test_compare_json_deep_new_null_returns_old_value);
-        CU_add_test (pSuite, "type_mismatch_returns_old_value",
-                     test_compare_json_deep_type_mismatch_returns_old_value);
+        CU_add_test (pSuite, "current_null_returns_json_null",
+                     test_compare_json_deep_current_null_returns_json_null);
+        CU_add_test (pSuite, "previous_null_returns_current_value",
+                     test_compare_json_deep_previous_null_returns_current_value);
+        CU_add_test (pSuite, "type_mismatch_returns_current_value",
+                     test_compare_json_deep_type_mismatch_returns_current_value);
         CU_add_test (pSuite, "equal_string_returns_null",
                      test_compare_json_deep_equal_string_returns_null);
         CU_add_test (pSuite, "equal_integer_returns_null",
                      test_compare_json_deep_equal_integer_returns_null);
-        CU_add_test (pSuite, "different_string_returns_old_value",
-                     test_compare_json_deep_different_string_returns_old_value);
-        CU_add_test (pSuite, "different_integer_returns_old_value",
-                     test_compare_json_deep_different_integer_returns_old_value);
+        CU_add_test (pSuite, "different_string_returns_current_value",
+                     test_compare_json_deep_different_string_returns_current_value);
+        CU_add_test (pSuite, "different_integer_returns_current_value",
+                     test_compare_json_deep_different_integer_returns_current_value);
         CU_add_test (pSuite, "equal_arrays_returns_null",
                      test_compare_json_deep_equal_arrays_returns_null);
-        CU_add_test (pSuite, "different_arrays_returns_old_array",
-                     test_compare_json_deep_different_arrays_returns_old_array);
+        CU_add_test (pSuite, "different_arrays_returns_current_array",
+                     test_compare_json_deep_different_arrays_returns_current_array);
 
         pSuite = CU_add_suite ("integration::compare_json_deep_objects", NULL, NULL);
         CU_add_test (pSuite, "empty_objects_returns_null",
                      test_compare_json_deep_empty_objects_returns_null);
         CU_add_test (pSuite, "equal_object_values_returns_null",
                      test_compare_json_deep_equal_object_values_returns_null);
-        CU_add_test (pSuite, "changed_object_value_returns_old_value_object",
-                     test_compare_json_deep_changed_object_value_returns_old_value_object);
-        CU_add_test (pSuite, "added_key_returns_json_null_marker",
-                     test_compare_json_deep_added_key_returns_json_null_marker);
-        CU_add_test (pSuite, "removed_key_returns_old_value",
-                     test_compare_json_deep_removed_key_returns_old_value);
+        CU_add_test (pSuite, "changed_object_value_returns_current_value_object",
+                     test_compare_json_deep_changed_object_value_returns_current_value_object);
+        CU_add_test (pSuite, "deleted_key_records_null_marker",
+                     test_compare_json_deep_deleted_key_records_null_marker);
+        CU_add_test (pSuite, "new_key_returns_current_value",
+                     test_compare_json_deep_new_key_returns_current_value);
 
         pSuite = CU_add_suite ("unit::reload_timing", NULL, NULL);
         CU_add_test (pSuite, "missing_timestamp_returns_frequency",
@@ -1286,6 +2013,47 @@ main (int argc, char *argv[])
                      test_read_last_poll_timestamp_valid_file_returns_value);
         CU_add_test (pSuite, "non_integer_returns_zero",
                      test_read_last_poll_timestamp_non_integer_returns_zero);
+        CU_add_test (pSuite, "reads_timestamp_from_last_diff",
+                     test_read_last_poll_timestamp_reads_from_diffs);
+
+        pSuite = CU_add_suite ("unit::apply_forward_diff", NULL, NULL);
+        CU_add_test (pSuite, "null_changes_returns_copy",
+                     test_apply_forward_diff_null_changes_returns_copy);
+        CU_add_test (pSuite, "empty_changes_returns_copy",
+                     test_apply_forward_diff_empty_changes_returns_copy);
+        CU_add_test (pSuite, "updates_existing_key",
+                     test_apply_forward_diff_updates_existing_key);
+        CU_add_test (pSuite, "adds_new_key", test_apply_forward_diff_adds_new_key);
+        CU_add_test (pSuite, "null_value_deletes_key",
+                     test_apply_forward_diff_null_value_deletes_key);
+        CU_add_test (pSuite, "nested_object_merges",
+                     test_apply_forward_diff_nested_object_merges);
+
+        pSuite = CU_add_suite ("unit::reconstruct_latest_snapshot", NULL, NULL);
+        CU_add_test (pSuite, "no_diffs_returns_baseline",
+                     test_reconstruct_no_diffs_returns_baseline);
+        CU_add_test (pSuite, "single_diff_applies", test_reconstruct_single_diff_applies);
+        CU_add_test (pSuite, "multiple_diffs_in_order",
+                     test_reconstruct_multiple_diffs_applies_in_order);
+        CU_add_test (pSuite, "diff_with_deletion", test_reconstruct_diff_with_deletion);
+
+        pSuite = CU_add_suite ("unit::append_diff_entry_to_file", NULL, NULL);
+        CU_add_test (pSuite, "appends_to_empty_array", test_append_diff_to_empty_array);
+        CU_add_test (pSuite, "appends_to_nonempty_array",
+                     test_append_diff_to_nonempty_array);
+        CU_add_test (pSuite, "nonexistent_file_fails",
+                     test_append_diff_nonexistent_file_fails);
+
+        pSuite = CU_add_suite ("integration::write_diff", NULL, NULL);
+        CU_add_test (pSuite, "creates_baseline_on_new_file",
+                     test_write_diff_creates_baseline_on_new_file);
+        CU_add_test (pSuite, "appends_empty_diff_when_unchanged",
+                     test_write_diff_appends_empty_diff_when_unchanged);
+        CU_add_test (pSuite, "records_changes", test_write_diff_records_changes);
+        CU_add_test (pSuite, "multiple_polls_accumulates",
+                     test_write_diff_multiple_polls_accumulates_diffs);
+        CU_add_test (pSuite, "reconstructs_from_existing_file",
+                     test_write_diff_reconstruct_from_existing_file);
 
         CU_basic_set_mode (CU_BRM_VERBOSE);
         CU_basic_run_tests ();
@@ -1294,7 +2062,6 @@ main (int argc, char *argv[])
 
         return failures ? -1 : 0;
     }
-
 
     if (!config_dir)
     {
