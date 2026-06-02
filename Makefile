@@ -53,7 +53,7 @@ all: alfred apteryx-sync apteryx-saver recorder
 	@echo "Compiling "$<""
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
-recorder: recorder.o
+recorder: recorder.o test_recorder.o
 	@echo "Building $@"
 	$(Q)$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $^ $(EXTRA_LDFLAGS)
 
@@ -80,14 +80,15 @@ apteryxd = \
 	kill -TERM `cat /tmp/apteryxd.pid`;
 
 
-# Nothing added for recorder yet....
-test: alfred apteryx-saver
+test: alfred apteryx-saver recorder
 	@echo "Running unit test: alfred"
 	$(Q)$(call apteryxd,alfred -u)
 	$(Q)rm -f alfred_test.xml alfred_test.map alfred_test.lua
 	@echo "Running unit test: saver"
 	$(Q)$(call apteryxd,apteryx-saver -u)
 	$(Q)rm -f saver_test.cfg
+	@echo "Running unit test: recorder"
+	$(Q)$(call apteryxd,recorder -u)
 	@echo "Tests have been run!"
 
 install: all

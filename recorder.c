@@ -14,35 +14,14 @@
 #include <ftw.h>
 #include <unistd.h>
 #include <signal.h>
-#include <CUnit/CUnit.h>
-#include <CUnit/Basic.h>
+#include <stdbool.h>
+
+#include "recorder.h"
 
 static const int json_indent = 2;
 
 /* Overrides the default logrotate output directory. Set via -l or in tests. NULL means use default */
-static const char *logrotate_dir_override = NULL;
-#define LOGROTATE_DIR_DEFAULT "/etc/logrotate-conf.d"
-#define LOGROTATE_INCLUDE_FILE "/etc/logrotate.d/recorder"
-
-static json_t *compare_json_deep (json_t *current_json, json_t *previous_json);
-
-typedef struct _config_data
-{
-    char *query;
-    long frequency;
-    char *destination;
-    int max_samples;
-    long max_size;
-
-    guint initial_delay;
-    GMainLoop *loop;
-    GMainContext *context;
-    GThread *thread;
-    GMutex mutex;
-    GCond cond;
-    gboolean thread_ready;
-    json_t *last_snapshot;
-} config_data;
+const char *logrotate_dir_override = NULL;
 
 static GHashTable *destination_registry = NULL;
 static GPtrArray *active_configs = NULL;
@@ -81,7 +60,7 @@ gnode_to_json (const GNode *node)
 }
 
 /* Generates destination directories if needed */
-static int
+int
 make_path (char *path)
 {
     char *p = path + (*path == '/');    // Skip leading /
@@ -99,7 +78,7 @@ make_path (char *path)
 
 
 /* Compares JSON objects by comparing their individual values */
-static json_t *
+json_t *
 compare_objects (json_t *current_obj, json_t *previous_obj)
 {
     json_t *changes = json_object ();
@@ -132,7 +111,7 @@ compare_objects (json_t *current_obj, json_t *previous_obj)
 }
 
 /* Compares current against previous, returning changed values for use in a forward diff. */
-static json_t *
+json_t *
 compare_json_deep (json_t *current_json, json_t *previous_json)
 {
     if (!current_json && !previous_json)
@@ -159,7 +138,7 @@ compare_json_deep (json_t *current_json, json_t *previous_json)
 
 
 /* Applies a forward diff to an older snapshot, determining a more recent state */
-static json_t *
+json_t *
 apply_forward_diff (json_t *snapshot, json_t *changes)
 {
     if (!changes || !json_is_object (changes))
@@ -192,7 +171,7 @@ apply_forward_diff (json_t *snapshot, json_t *changes)
 }
 
 /* Rebuilds the latest snapshot from a baseline + array of forward diffs */
-static json_t *
+json_t *
 reconstruct_latest_snapshot (json_t *baseline, json_t *diffs)
 {
     json_t *snapshot = json_deep_copy (baseline);
@@ -210,7 +189,7 @@ reconstruct_latest_snapshot (json_t *baseline, json_t *diffs)
 }
 
 /* Appends a single entry to the diffs array via seek, minimising disk write */
-static int
+int
 append_diff_entry_to_file (const char *path, json_t *diff_entry)
 {
     FILE *f = fopen (path, "r+");
@@ -219,50 +198,58 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
         return -1;
     }
 
-    // Find the last ']' in the file (closing the diffs array)
     fseek (f, 0, SEEK_END);
     long file_size = ftell (f);
-    long pos = file_size - 1;
 
-    while (pos >= 0)
-    {
-        fseek (f, pos, SEEK_SET);
-        int ch = fgetc (f);
-        if (ch == ']')
-        {
-            break;
-        }
-        pos--;
-    }
+    /* Read the tail of the file in one shot to find structural characters
+     * Assumes the array is in the last TAIL_BUF_SIZE number of bytes */
+#define TAIL_BUF_SIZE 64
+    long tail_start = file_size > TAIL_BUF_SIZE ? file_size - TAIL_BUF_SIZE : 0;
+    long tail_len = file_size - tail_start;
+    char tail_buf[TAIL_BUF_SIZE];
 
-    if (pos < 0)    // No ']' in file. Likely empty.
+    fseek (f, tail_start, SEEK_SET);
+    if ((long) fread (tail_buf, 1, tail_len, f) != tail_len)
     {
         fclose (f);
         return -1;
     }
 
-    long bracket_pos = pos;
-
-    gboolean empty_array = FALSE;
-    pos = bracket_pos - 1;
-    while (pos >= 0)
+    /* Find the last ']' (closing the diffs array) */
+    long bracket_pos = -1;
+    for (long i = tail_len - 1; i >= 0; i--)
     {
-        fseek (f, pos, SEEK_SET);
-        int ch = fgetc (f);
-        if (ch == '[')
+        if (tail_buf[i] == ']')
+        {
+            bracket_pos = tail_start + i;
+            break;
+        }
+    }
+
+    if (bracket_pos < 0)
+    {
+        fclose (f);
+        return -1;
+    }
+
+    /* Check if the array is empty by scanning back from ']' for '[' or non-whitespace */
+    long bracket_offset = bracket_pos - tail_start;
+    gboolean empty_array = FALSE;
+    for (long i = bracket_offset - 1; i >= 0; i--)
+    {
+        if (tail_buf[i] == '[')
         {
             empty_array = TRUE;
             break;
         }
-        if (!isspace (ch))
+        if (!isspace ((unsigned char) tail_buf[i]))
         {
             break;
         }
-        pos--;
     }
 
     char *entry_str = json_dumps (diff_entry, JSON_COMPACT);
-    if (!entry_str) // Shouldn't happen, but prevents undefined behaviour in fprintf if NULL.
+    if (!entry_str)
     {
         fclose (f);
         return -1;
@@ -271,28 +258,32 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
     if (empty_array)
     {
         fseek (f, bracket_pos, SEEK_SET);
-        fprintf (f, "\n    %s\n  ]\n  }\n", entry_str);
+        fprintf (f, "\n    %s\n  ]\n}\n", entry_str);
     }
     else
     {
-        // Scan to find '}' of the previous entry, so the comma trails the previous entry
-        pos = bracket_pos - 1;
-        while (pos >= 0)
+        /* Find '}' of the previous entry so the comma trails correctly */
+        long brace_pos = -1;
+        for (long i = bracket_offset - 1; i >= 0; i--)
         {
-            fseek (f, pos, SEEK_SET);
-            int ch = fgetc (f);
-            if (ch == '}')
+            if (tail_buf[i] == '}')
             {
+                brace_pos = tail_start + i;
                 break;
             }
-            pos--;
         }
-        fseek (f, pos + 1, SEEK_SET);
+        if (brace_pos < 0)
+        {
+            free (entry_str);
+            fclose (f);
+            return -1;
+        }
+        fseek (f, brace_pos + 1, SEEK_SET);
         fprintf (f, ",\n    %s\n  ]\n}\n", entry_str);
     }
 
     long new_end = ftell (f);
-    if (ftruncate (fileno (f), new_end) != 0) // Redundant safety net.
+    if (ftruncate (fileno (f), new_end) != 0)
     {
         free (entry_str);
         fclose (f);
@@ -305,27 +296,28 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
 }
 
 /* Edits (or creates) JSON diff file. Uses an in-memory cache to optimise calculations */
-static int
+int
 write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
 {
     int error_code;
-    json_error_t error;
-    json_t *storage = json_load_file (path_to_diff, 0, &error);
 
-    if (!*last_snapshot_cache || !storage)
+    if (!*last_snapshot_cache)
     {
+        /* No cache: either first call after startup or SIGHUP reload */
+        json_error_t error;
+        json_t *storage = json_load_file (path_to_diff, 0, &error);
+
         if (storage)
         {
-            // Reconstruct latest state from existing file. Likely a SIGHUP reload
+            /* Reconstruct latest state from existing file */
             json_t *baseline = json_object_get (storage, "baseline");
             json_t *diffs = json_object_get (storage, "diffs");
             *last_snapshot_cache = reconstruct_latest_snapshot (baseline, diffs);
             json_decref (storage);
-            storage = NULL;
         }
         else
         {
-            // No existing file: write baseline and set cache to current state
+            /* No existing file: write baseline and set cache to current state */
             json_t *new_storage = json_object ();
             json_object_set_new (new_storage, "baseline_timestamp",
                                  json_integer (time (NULL)));
@@ -350,15 +342,10 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
     error_code = append_diff_entry_to_file (path_to_diff, diff_entry);
     json_decref (diff_entry);
 
-    if (error_code == 0 && changes != NULL) // Only update if there were valid changes
+    if (error_code == 0 && changes != NULL)
     {
         json_decref (*last_snapshot_cache);
         *last_snapshot_cache = json_deep_copy (current_json);
-    }
-
-    if (storage)
-    {
-        json_decref (storage);
     }
 
     return error_code;
@@ -366,7 +353,7 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
 
 
 /* Creates a unique name for logrotate config file based on specified diff destination */
-static char *
+char *
 sanitize_path_for_config (const char *path)
 {
     char *result = malloc (strlen (path) + 8);
@@ -390,7 +377,7 @@ sanitize_path_for_config (const char *path)
 }
 
 /* Turns a relative path into absolute for consistent comparison */
-static char *
+char *
 resolve_absolute_path (const char *path)
 {
     /* Path should always exist, as it will crash earlier if not. File might not */
@@ -415,7 +402,7 @@ resolve_absolute_path (const char *path)
 }
 
 /* Writes a single include directive, allowing logrotate to read from our logrotate config directory */
-static int
+int
 create_logrotate_include (void)
 {
     const char *out_dir = logrotate_dir_override ? logrotate_dir_override
@@ -436,7 +423,7 @@ create_logrotate_include (void)
 }
 
 /* Makes a logrotate config based on user-specified settings */
-static int
+int
 create_logrotate_config (config_data *config)
 {
     char *absolute_path = resolve_absolute_path (config->destination);
@@ -491,14 +478,14 @@ create_logrotate_config (config_data *config)
 
 
 /* Main function called by the GLib thread */
-static gboolean
+gboolean
 polling_callback (gpointer user_data)
 {
     config_data *config = (config_data *) user_data;
 
     GNode *root = g_node_new (g_strdup ("/"));
     apteryx_query_to_node (root, config->query);
-    GNode *tree = apteryx_query (root);
+    GNode *tree = config->query_fn ? config->query_fn (root) : apteryx_query (root);
     apteryx_free_tree (root);
 
     json_t *json_from_tree = tree ? gnode_to_json (tree) : NULL;
@@ -523,15 +510,15 @@ polling_callback (gpointer user_data)
     return G_SOURCE_CONTINUE;
 }
 
-/* Helper to schedule a callback based on a delay */
-static void
+/* Helper to schedule a callback based on a delay. Returns the GSource with one ref held by the caller. */
+static GSource *
 schedule_periodic_polling (config_data *config, GMainContext *context,
                            GSourceFunc callback_function, long delay)
 {
     GSource *timeout = g_timeout_source_new_seconds (delay);
     g_source_set_callback (timeout, callback_function, config, NULL);
     g_source_attach (timeout, context);
-    g_source_unref (timeout);
+    return timeout;
 }
 
 /* Used when a thread is interrupted and has to wait for a non-standard length */
@@ -540,17 +527,26 @@ initial_polling_callback (gpointer user_data)
 {
     config_data *config = (config_data *) user_data;
 
+    /* If force_poll_cb already ran during the initial delay, skip to avoid a duplicate
+     * poll and a second periodic source being scheduled. */
+    if (config->poll_source)
+    {
+        return G_SOURCE_REMOVE;
+    }
+
     if (polling_callback (config) == G_SOURCE_CONTINUE)
     {
-        schedule_periodic_polling (config, g_main_context_get_thread_default (),
-                                   polling_callback, config->frequency);
+        config->poll_source = schedule_periodic_polling (config,
+                                                         g_main_context_get_thread_default
+                                                         (), polling_callback,
+                                                         config->frequency);
     }
 
     return G_SOURCE_REMOVE;
 }
 
 /* Calculates the remaining delay for an interrupted thread */
-static guint
+guint
 calculate_initial_delay_at (long frequency, time_t last_poll_timestamp, time_t now)
 {
     // If there is no record, or it is somehow in the future, just wait the full frequency
@@ -570,7 +566,7 @@ calculate_initial_delay_at (long frequency, time_t last_poll_timestamp, time_t n
 
 /* Determines when the last poll was.
  * Reads the timestamp from the last diff entry, or the baseline if no diffs exist. */
-static time_t
+time_t
 read_last_poll_timestamp (const char *path_to_diff)
 {
     json_error_t error;
@@ -625,8 +621,10 @@ thread_func (gpointer user_data)
 
     g_main_context_push_thread_default (context);
 
-    schedule_periodic_polling (config, context, initial_polling_callback,
-                               config->initial_delay);
+    GSource *initial_src =
+        schedule_periodic_polling (config, context, initial_polling_callback,
+                                   config->initial_delay);
+    g_source_unref (initial_src);
     g_main_loop_run (loop);
 
     g_main_context_pop_thread_default (context);
@@ -643,7 +641,7 @@ thread_func (gpointer user_data)
 }
 
 /* Frees data on error */
-static void
+void
 config_data_free (config_data *config)
 {
     if (config)
@@ -653,6 +651,10 @@ config_data_free (config_data *config)
         if (config->last_snapshot)
         {
             json_decref (config->last_snapshot);
+        }
+        if (config->poll_source)
+        {
+            g_source_unref (config->poll_source);
         }
         g_mutex_clear (&config->mutex);
         g_cond_clear (&config->cond);
@@ -758,7 +760,7 @@ start_config_set (GPtrArray *configs)
 }
 
 /* Frees global variables */
-static void
+void
 destination_registry_free_all ()
 {
     free_config_set (destination_registry, active_configs);
@@ -789,7 +791,7 @@ destination_registry_add (GHashTable *registry,
 }
 
 /* Ensures destination can be created, and has not already been claimed */
-static int
+int
 validate_destination (GHashTable *registry,
                       const char *destination_path, const char *config_path)
 {
@@ -819,7 +821,7 @@ validate_destination (GHashTable *registry,
 }
 
 /* Validates the data provided in the config file. Mostly checks types */
-static int
+int
 validate_and_set_data (json_t *data,
                        config_data *config, GHashTable *registry, const char *config_path)
 {
@@ -931,7 +933,7 @@ initialise_config (json_t *data,
 }
 
 /* Gets all JSON files from specified directory and tries to write data to configs */
-static int
+int
 load_configs_from_directory (const char *config_dir,
                              GHashTable *registry, GPtrArray *configs)
 {
@@ -973,27 +975,26 @@ load_configs_from_directory (const char *config_dir,
             fprintf (stderr,
                      "error: unable to open file: %s. May be empty or have too many objects\n",
                      path_to_file);
-            free (absolute_config_dir);
             g_free (path_to_file);
-            closedir (dir);
-            return -1;
+            configs->len = 0;   /* signal failure via post-loop check */
+            break;
         }
 
         if (initialise_config (root, path_to_file, registry, configs) != 0)
         {
             fprintf (stderr, "error: failed to initialise config from file: %s\n",
                      path_to_file);
-            free (absolute_config_dir);
-            g_free (path_to_file);
             json_decref (root);
-            closedir (dir);
-            return -1;
+            g_free (path_to_file);
+            configs->len = 0;   /* signal failure via post-loop check */
+            break;
         }
 
         json_decref (root);
         g_free (path_to_file);
     }
 
+    /* Single shared cleanup: absolute_config_dir and dir are always freed here */
     free (absolute_config_dir);
     closedir (dir);
 
@@ -1055,6 +1056,61 @@ replace_active_configs (const char *config_dir)
     return 0;
 }
 
+/* Cancels the current periodic poll source, fires an immediate poll, and reschedules */
+static gboolean
+force_poll_cb (gpointer user_data)
+{
+    config_data *config = (config_data *) user_data;
+
+    if (config->poll_source)
+    {
+        g_source_destroy (config->poll_source);
+        g_source_unref (config->poll_source);
+        config->poll_source = NULL;
+    }
+
+    if (polling_callback (config) == G_SOURCE_CONTINUE)
+    {
+        config->poll_source = schedule_periodic_polling (config,
+                                                         g_main_context_get_thread_default
+                                                         (), polling_callback,
+                                                         config->frequency);
+    }
+
+    return G_SOURCE_REMOVE;
+}
+
+/* Runs on SIGUSR1. Forces a poll (and resets the timer) for every active config. */
+static gboolean
+force_poll_handler (gpointer user_data)
+{
+    (void) user_data;
+
+    if (!active_configs)
+    {
+        return G_SOURCE_CONTINUE;
+    }
+
+    for (guint i = 0; i < active_configs->len; i++)
+    {
+        config_data *config = g_ptr_array_index (active_configs, i);
+
+        g_mutex_lock (&config->mutex);
+        GMainContext *context =
+            config->context ? g_main_context_ref (config->context) : NULL;
+        g_mutex_unlock (&config->mutex);
+
+        if (context)
+        {
+            g_main_context_invoke_full (context, G_PRIORITY_DEFAULT,
+                                        force_poll_cb, config, NULL);
+            g_main_context_unref (context);
+        }
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
 /* Runs on SIGHUP. Attempts to reload from current config directory */
 static gboolean
 reload_handler (gpointer user_data)
@@ -1070,867 +1126,12 @@ reload_handler (gpointer user_data)
 }
 
 
-void
-test_compare_json_deep_both_null_returns_null ()
-{
-    json_t *result = compare_json_deep (NULL, NULL);
-    CU_ASSERT_PTR_NULL (result);
-}
-
-void
-test_compare_json_deep_current_null_returns_json_null ()
-{
-    json_t *previous_json = json_object ();
-    json_t *result = compare_json_deep (NULL, previous_json);
-    json_t *expected = json_null ();
-
-    CU_ASSERT_EQUAL (result, expected);
-
-    json_decref (previous_json);
-    json_decref (result);
-    json_decref (expected);
-}
-
-void
-test_compare_json_deep_previous_null_returns_current_value ()
-{
-    json_t *current_json = json_object ();
-    json_t *result = compare_json_deep (current_json, NULL);
-
-    CU_ASSERT_PTR_EQUAL (result, current_json);
-
-    json_decref (current_json);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_type_mismatch_returns_current_value ()
-{
-    json_t *current_json = json_object ();
-    json_t *previous_json = json_string ("previous value");
-    json_t *result = compare_json_deep (current_json, previous_json);
-
-    CU_ASSERT_PTR_EQUAL (result, current_json);
-
-    json_decref (current_json);
-    json_decref (previous_json);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_equal_string_returns_null ()
-{
-    json_t *current_json = json_string ("value");
-    json_t *previous_json = json_string ("value");
-    json_t *result = compare_json_deep (current_json, previous_json);
-
-    CU_ASSERT_PTR_NULL (result);
-
-    json_decref (current_json);
-    json_decref (previous_json);
-}
-
-void
-test_compare_json_deep_equal_integer_returns_null ()
-{
-    json_t *current_json = json_integer (42);
-    json_t *previous_json = json_integer (42);
-    json_t *result = compare_json_deep (current_json, previous_json);
-
-    CU_ASSERT_PTR_NULL (result);
-
-    json_decref (current_json);
-    json_decref (previous_json);
-}
-
-void
-test_compare_json_deep_different_string_returns_current_value ()
-{
-    json_t *current_json = json_string ("new value");
-    json_t *previous_json = json_string ("old value");
-    json_t *result = compare_json_deep (current_json, previous_json);
-
-    CU_ASSERT_PTR_EQUAL (result, current_json);
-
-    json_decref (current_json);
-    json_decref (previous_json);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_different_integer_returns_current_value ()
-{
-    json_t *current_json = json_integer (42);
-    json_t *previous_json = json_integer (41);
-    json_t *result = compare_json_deep (current_json, previous_json);
-
-    CU_ASSERT_PTR_EQUAL (result, current_json);
-
-    json_decref (current_json);
-    json_decref (previous_json);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_equal_arrays_returns_null ()
-{
-    json_t *current_arr = json_array ();
-    json_array_append_new (current_arr, json_integer (1));
-    json_array_append_new (current_arr, json_integer (2));
-    json_t *previous_arr = json_array ();
-    json_array_append_new (previous_arr, json_integer (1));
-    json_array_append_new (previous_arr, json_integer (2));
-    json_t *result = compare_json_deep (current_arr, previous_arr);
-
-    CU_ASSERT_PTR_NULL (result);
-
-    json_decref (current_arr);
-    json_decref (previous_arr);
-}
-
-void
-test_compare_json_deep_different_arrays_returns_current_array ()
-{
-    json_t *current_arr = json_array ();
-    json_array_append_new (current_arr, json_integer (1));
-    json_array_append_new (current_arr, json_integer (2));
-    json_array_append_new (current_arr, json_integer (3));
-    json_t *previous_arr = json_array ();
-    json_array_append_new (previous_arr, json_integer (1));
-    json_array_append_new (previous_arr, json_integer (2));
-    json_t *result = compare_json_deep (current_arr, previous_arr);
-
-    CU_ASSERT_PTR_EQUAL (result, current_arr);
-
-    json_decref (current_arr);
-    json_decref (previous_arr);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_empty_objects_returns_null ()
-{
-    json_t *current_obj = json_object ();
-    json_t *previous_obj = json_object ();
-    json_t *result = compare_json_deep (current_obj, previous_obj);
-
-    CU_ASSERT_PTR_NULL (result);
-
-    json_decref (current_obj);
-    json_decref (previous_obj);
-}
-
-void
-test_compare_json_deep_equal_object_values_returns_null ()
-{
-    json_t *current_obj = json_object ();
-    json_t *previous_obj = json_object ();
-    json_object_set_new (current_obj, "key1", json_string ("value"));
-    json_object_set_new (previous_obj, "key1", json_string ("value"));
-    json_t *result = compare_json_deep (current_obj, previous_obj);
-
-    CU_ASSERT_PTR_NULL (result);
-
-    json_decref (current_obj);
-    json_decref (previous_obj);
-}
-
-void
-test_compare_json_deep_changed_object_value_returns_current_value_object ()
-{
-    json_t *current_obj = json_object ();
-    json_t *previous_obj = json_object ();
-    json_object_set_new (current_obj, "key1", json_string ("new value"));
-    json_object_set_new (previous_obj, "key1", json_string ("old value"));
-    json_t *result = compare_json_deep (current_obj, previous_obj);
-
-    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
-    CU_ASSERT_TRUE (json_equal (result, current_obj));
-
-    json_decref (current_obj);
-    json_decref (previous_obj);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_deleted_key_records_null_marker ()
-{
-    json_t *current_obj = json_object ();
-    json_t *previous_obj = json_object ();
-    json_object_set_new (previous_obj, "key1", json_string ("value"));
-
-    json_t *result = compare_json_deep (current_obj, previous_obj);
-    json_t *diff = json_object_get (result, "key1");
-    json_t *expected_null = json_null ();
-
-    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
-    CU_ASSERT_EQUAL (diff, expected_null);
-
-    json_decref (expected_null);
-    json_decref (current_obj);
-    json_decref (previous_obj);
-    json_decref (result);
-}
-
-void
-test_compare_json_deep_new_key_returns_current_value ()
-{
-    json_t *current_obj = json_object ();
-    json_t *previous_obj = json_object ();
-    json_object_set_new (current_obj, "key1", json_string ("value"));
-    json_object_set_new (current_obj, "key2", json_string ("new value"));
-    json_object_set_new (previous_obj, "key1", json_string ("value"));
-
-    json_t *result = compare_json_deep (current_obj, previous_obj);
-    json_t *diff = json_object_get (result, "key2");
-    json_t *expected = json_string ("new value");
-
-    CU_ASSERT_EQUAL (json_typeof (result), JSON_OBJECT);
-    CU_ASSERT_TRUE (json_equal (diff, expected));
-
-    json_decref (expected);
-    json_decref (current_obj);
-    json_decref (previous_obj);
-    json_decref (result);
-}
-
-
-void
-test_calculate_initial_delay_at_missing_timestamp_returns_frequency ()
-{
-    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 0, 100), 30);
-}
-
-void
-test_calculate_initial_delay_at_future_timestamp_returns_frequency ()
-{
-    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 200, 100), 30);
-}
-
-void
-test_calculate_initial_delay_at_overdue_returns_immediate ()
-{
-    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 60, 100), 0);
-}
-
-void
-test_calculate_initial_delay_at_partial_interval_returns_remaining ()
-{
-    CU_ASSERT_EQUAL (calculate_initial_delay_at (30, 80, 100), 10);
-}
-
-void
-test_read_last_poll_timestamp_missing_file_returns_zero ()
-{
-    time_t result = read_last_poll_timestamp ("");
-    CU_ASSERT_EQUAL (result, 0);
-}
-
-static int
-write_test_timestamp_file (const char *path_to_diff, json_t *timestamp)
-{
-    json_t *root = json_object ();
-
-    if (timestamp)
-    {
-        json_object_set (root, "baseline_timestamp", timestamp);
-    }
-
-    json_object_set_new (root, "baseline", json_object ());
-    json_object_set_new (root, "diffs", json_array ());
-
-    int rc = json_dump_file (root, path_to_diff, 0);
-    json_decref (root);
-    return rc;
-}
-
-void
-test_read_last_poll_timestamp_valid_file_returns_value ()
-{
-    char path[] = "/tmp/recorder_timestamp_valid_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-
-    json_t *timestamp = json_integer (1234);
-
-    CU_ASSERT_EQUAL_FATAL (write_test_timestamp_file (path, timestamp), 0);
-
-    time_t result = read_last_poll_timestamp (path);
-    CU_ASSERT_EQUAL (result, 1234);
-
-    unlink (path);
-    json_decref (timestamp);
-}
-
-void
-test_read_last_poll_timestamp_non_integer_returns_zero ()
-{
-    char path[] = "/tmp/recorder_timestamp_nonint_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-
-    json_t *timestamp = json_string ("bad");
-
-    CU_ASSERT_EQUAL_FATAL (write_test_timestamp_file (path, timestamp), 0);
-
-    time_t result = read_last_poll_timestamp (path);
-    CU_ASSERT_EQUAL (result, 0);
-
-    unlink (path);
-    json_decref (timestamp);
-}
-
-
-void
-test_apply_forward_diff_null_changes_returns_copy ()
-{
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("val"));
-
-    json_t *result = apply_forward_diff (snapshot, NULL);
-
-    CU_ASSERT_TRUE (json_equal (result, snapshot));
-    CU_ASSERT_PTR_NOT_EQUAL (result, snapshot);
-
-    json_decref (snapshot);
-    json_decref (result);
-}
-
-void
-test_apply_forward_diff_empty_changes_returns_copy ()
-{
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("val"));
-    json_t *changes = json_object ();
-
-    json_t *result = apply_forward_diff (snapshot, changes);
-
-    CU_ASSERT_TRUE (json_equal (result, snapshot));
-    CU_ASSERT_PTR_NOT_EQUAL (result, snapshot);
-
-    json_decref (snapshot);
-    json_decref (changes);
-    json_decref (result);
-}
-
-void
-test_apply_forward_diff_updates_existing_key ()
-{
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("old"));
-    json_t *changes = json_object ();
-    json_object_set_new (changes, "key", json_string ("new"));
-
-    json_t *result = apply_forward_diff (snapshot, changes);
-    json_t *expected = json_string ("new");
-
-    CU_ASSERT_TRUE (json_equal (json_object_get (result, "key"), expected));
-
-    json_decref (snapshot);
-    json_decref (changes);
-    json_decref (result);
-    json_decref (expected);
-}
-
-void
-test_apply_forward_diff_adds_new_key ()
-{
-    json_t *snapshot = json_object ();
-    json_t *changes = json_object ();
-    json_object_set_new (changes, "added", json_string ("value"));
-
-    json_t *result = apply_forward_diff (snapshot, changes);
-
-    CU_ASSERT_PTR_NOT_NULL (json_object_get (result, "added"));
-    CU_ASSERT_TRUE (json_equal (json_object_get (result, "added"),
-                                json_object_get (changes, "added")));
-
-    json_decref (snapshot);
-    json_decref (changes);
-    json_decref (result);
-}
-
-void
-test_apply_forward_diff_null_value_deletes_key ()
-{
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("val"));
-    json_t *changes = json_object ();
-    json_object_set_new (changes, "key", json_null ());
-
-    json_t *result = apply_forward_diff (snapshot, changes);
-
-    CU_ASSERT_PTR_NULL (json_object_get (result, "key"));
-    CU_ASSERT_EQUAL (json_object_size (result), 0);
-
-    json_decref (snapshot);
-    json_decref (changes);
-    json_decref (result);
-}
-
-void
-test_apply_forward_diff_nested_object_merges ()
-{
-    json_t *inner = json_object ();
-    json_object_set_new (inner, "a", json_string ("1"));
-    json_object_set_new (inner, "b", json_string ("2"));
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "nested", inner);
-
-    json_t *inner_change = json_object ();
-    json_object_set_new (inner_change, "b", json_string ("changed"));
-    json_t *changes = json_object ();
-    json_object_set_new (changes, "nested", inner_change);
-
-    json_t *result = apply_forward_diff (snapshot, changes);
-    json_t *result_nested = json_object_get (result, "nested");
-
-    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result_nested, "a")), "1");
-    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result_nested, "b")),
-                            "changed");
-
-    json_decref (snapshot);
-    json_decref (changes);
-    json_decref (result);
-}
-
-
-void
-test_reconstruct_no_diffs_returns_baseline ()
-{
-    json_t *baseline = json_object ();
-    json_object_set_new (baseline, "key", json_string ("val"));
-    json_t *diffs = json_array ();
-
-    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
-
-    CU_ASSERT_TRUE (json_equal (result, baseline));
-    CU_ASSERT_PTR_NOT_EQUAL (result, baseline);
-
-    json_decref (baseline);
-    json_decref (diffs);
-    json_decref (result);
-}
-
-void
-test_reconstruct_single_diff_applies ()
-{
-    json_t *baseline = json_object ();
-    json_object_set_new (baseline, "key", json_string ("v1"));
-
-    json_t *diff_changes = json_object ();
-    json_object_set_new (diff_changes, "key", json_string ("v2"));
-    json_t *diff_entry = json_object ();
-    json_object_set_new (diff_entry, "changes", diff_changes);
-
-    json_t *diffs = json_array ();
-    json_array_append_new (diffs, diff_entry);
-
-    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
-    json_t *expected = json_string ("v2");
-
-    CU_ASSERT_TRUE (json_equal (json_object_get (result, "key"), expected));
-
-    json_decref (baseline);
-    json_decref (diffs);
-    json_decref (result);
-    json_decref (expected);
-}
-
-void
-test_reconstruct_multiple_diffs_applies_in_order ()
-{
-    json_t *baseline = json_object ();
-    json_object_set_new (baseline, "key", json_string ("v1"));
-
-    json_t *d1_changes = json_object ();
-    json_object_set_new (d1_changes, "key", json_string ("v2"));
-    json_t *d1 = json_object ();
-    json_object_set_new (d1, "changes", d1_changes);
-
-    json_t *d2_changes = json_object ();
-    json_object_set_new (d2_changes, "key", json_string ("v3"));
-    json_t *d2 = json_object ();
-    json_object_set_new (d2, "changes", d2_changes);
-
-    json_t *diffs = json_array ();
-    json_array_append_new (diffs, d1);
-    json_array_append_new (diffs, d2);
-
-    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
-
-    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (result, "key")), "v3");
-
-    json_decref (baseline);
-    json_decref (diffs);
-    json_decref (result);
-}
-
-void
-test_reconstruct_diff_with_deletion ()
-{
-    json_t *baseline = json_object ();
-    json_object_set_new (baseline, "a", json_string ("1"));
-    json_object_set_new (baseline, "b", json_string ("2"));
-
-    json_t *changes = json_object ();
-    json_object_set_new (changes, "b", json_null ());
-    json_t *d = json_object ();
-    json_object_set_new (d, "changes", changes);
-
-    json_t *diffs = json_array ();
-    json_array_append_new (diffs, d);
-
-    json_t *result = reconstruct_latest_snapshot (baseline, diffs);
-
-    CU_ASSERT_PTR_NOT_NULL (json_object_get (result, "a"));
-    CU_ASSERT_PTR_NULL (json_object_get (result, "b"));
-
-    json_decref (baseline);
-    json_decref (diffs);
-    json_decref (result);
-}
-
-
-void
-test_append_diff_to_empty_array ()
-{
-    char path[] = "/tmp/recorder_append_empty_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-
-    /* Write a minimal valid file with empty diffs array */
-    json_t *storage = json_object ();
-    json_object_set_new (storage, "baseline_timestamp", json_integer (100));
-    json_object_set_new (storage, "baseline", json_object ());
-    json_object_set_new (storage, "diffs", json_array ());
-    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
-    json_decref (storage);
-
-    json_t *entry = json_object ();
-    json_object_set_new (entry, "timestamp", json_integer (200));
-    json_object_set_new (entry, "changes", json_object ());
-
-    CU_ASSERT_EQUAL (append_diff_entry_to_file (path, entry), 0);
-    json_decref (entry);
-
-    /* Verify the file is still valid JSON with one diff */
-    json_error_t error;
-    json_t *reloaded = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (reloaded);
-
-    json_t *diffs = json_object_get (reloaded, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
-    CU_ASSERT_EQUAL (json_integer_value
-                     (json_object_get (json_array_get (diffs, 0), "timestamp")), 200);
-
-    json_decref (reloaded);
-    unlink (path);
-}
-
-void
-test_append_diff_to_nonempty_array ()
-{
-    char path[] = "/tmp/recorder_append_nonempty_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-
-    /* Write file with one existing diff */
-    json_t *existing_entry = json_object ();
-    json_object_set_new (existing_entry, "timestamp", json_integer (100));
-    json_object_set_new (existing_entry, "changes", json_object ());
-    json_t *diffs_arr = json_array ();
-    json_array_append_new (diffs_arr, existing_entry);
-
-    json_t *storage = json_object ();
-    json_object_set_new (storage, "baseline_timestamp", json_integer (50));
-    json_object_set_new (storage, "baseline", json_object ());
-    json_object_set_new (storage, "diffs", diffs_arr);
-    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
-    json_decref (storage);
-
-    json_t *entry = json_object ();
-    json_object_set_new (entry, "timestamp", json_integer (200));
-    json_object_set_new (entry, "changes", json_object ());
-
-    CU_ASSERT_EQUAL (append_diff_entry_to_file (path, entry), 0);
-    json_decref (entry);
-
-    json_error_t error;
-    json_t *reloaded = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (reloaded);
-
-    json_t *diffs = json_object_get (reloaded, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 2);
-    CU_ASSERT_EQUAL (json_integer_value
-                     (json_object_get (json_array_get (diffs, 0), "timestamp")), 100);
-    CU_ASSERT_EQUAL (json_integer_value
-                     (json_object_get (json_array_get (diffs, 1), "timestamp")), 200);
-
-    json_decref (reloaded);
-    unlink (path);
-}
-
-void
-test_append_diff_nonexistent_file_fails ()
-{
-    json_t *entry = json_object ();
-    json_object_set_new (entry, "timestamp", json_integer (100));
-    json_object_set_new (entry, "changes", json_object ());
-
-    CU_ASSERT_NOT_EQUAL (append_diff_entry_to_file
-                         ("/tmp/recorder_nonexistent_file_xyz", entry), 0);
-
-    json_decref (entry);
-}
-
-
-void
-test_write_diff_creates_baseline_on_new_file ()
-{
-    char path[] = "/tmp/recorder_wd_new_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-    unlink (path);  /* Ensure file does not exist */
-
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("val"));
-    json_t *cache = NULL;
-
-    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
-    CU_ASSERT_PTR_NOT_NULL (cache);
-
-    /* Verify file structure */
-    json_error_t error;
-    json_t *storage = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
-    CU_ASSERT_PTR_NOT_NULL (json_object_get (storage, "baseline"));
-    CU_ASSERT_PTR_NOT_NULL (json_object_get (storage, "baseline_timestamp"));
-    CU_ASSERT_TRUE (json_equal (json_object_get (storage, "baseline"), snapshot));
-    CU_ASSERT_EQUAL (json_array_size (json_object_get (storage, "diffs")), 0);
-
-    json_decref (storage);
-    json_decref (snapshot);
-    json_decref (cache);
-    unlink (path);
-}
-
-void
-test_write_diff_appends_empty_diff_when_unchanged ()
-{
-    char path[] = "/tmp/recorder_wd_unchanged_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-    unlink (path);
-
-    json_t *snapshot = json_object ();
-    json_object_set_new (snapshot, "key", json_string ("val"));
-    json_t *cache = NULL;
-
-    /* First call creates baseline */
-    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
-    /* Second call with same data */
-    CU_ASSERT_EQUAL (write_diff (snapshot, path, &cache), 0);
-
-    json_error_t error;
-    json_t *storage = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
-
-    json_t *diffs = json_object_get (storage, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
-
-    /* Changes should be empty object */
-    json_t *first_diff = json_array_get (diffs, 0);
-    json_t *changes = json_object_get (first_diff, "changes");
-    CU_ASSERT_EQUAL (json_object_size (changes), 0);
-
-    json_decref (storage);
-    json_decref (snapshot);
-    json_decref (cache);
-    unlink (path);
-}
-
-void
-test_write_diff_records_changes ()
-{
-    char path[] = "/tmp/recorder_wd_changes_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-    unlink (path);
-
-    json_t *snap1 = json_object ();
-    json_object_set_new (snap1, "key", json_string ("v1"));
-    json_t *cache = NULL;
-
-    CU_ASSERT_EQUAL (write_diff (snap1, path, &cache), 0);
-
-    json_t *snap2 = json_object ();
-    json_object_set_new (snap2, "key", json_string ("v2"));
-
-    CU_ASSERT_EQUAL (write_diff (snap2, path, &cache), 0);
-
-    json_error_t error;
-    json_t *storage = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
-
-    /* Baseline should still be v1 */
-    CU_ASSERT_STRING_EQUAL (json_string_value
-                            (json_object_get
-                             (json_object_get (storage, "baseline"), "key")), "v1");
-
-    /* Diff should record the new value v2 */
-    json_t *diffs = json_object_get (storage, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
-    json_t *changes = json_object_get (json_array_get (diffs, 0), "changes");
-    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (changes, "key")), "v2");
-
-    json_decref (storage);
-    json_decref (snap1);
-    json_decref (snap2);
-    json_decref (cache);
-    unlink (path);
-}
-
-void
-test_write_diff_multiple_polls_accumulates_diffs ()
-{
-    char path[] = "/tmp/recorder_wd_multi_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-    unlink (path);
-
-    json_t *cache = NULL;
-
-    json_t *s1 = json_object ();
-    json_object_set_new (s1, "key", json_string ("v1"));
-    CU_ASSERT_EQUAL (write_diff (s1, path, &cache), 0);
-
-    json_t *s2 = json_object ();
-    json_object_set_new (s2, "key", json_string ("v2"));
-    CU_ASSERT_EQUAL (write_diff (s2, path, &cache), 0);
-
-    json_t *s3 = json_object ();
-    json_object_set_new (s3, "key", json_string ("v3"));
-    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
-
-    /* Same as s3 - empty diff */
-    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
-
-    json_error_t error;
-    json_t *storage = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
-
-    json_t *diffs = json_object_get (storage, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 3);
-
-    /* Verify baseline untouched */
-    CU_ASSERT_STRING_EQUAL (json_string_value
-                            (json_object_get
-                             (json_object_get (storage, "baseline"), "key")), "v1");
-
-    json_decref (storage);
-    json_decref (s1);
-    json_decref (s2);
-    json_decref (s3);
-    json_decref (cache);
-    unlink (path);
-}
-
-void
-test_write_diff_reconstruct_from_existing_file ()
-{
-    char path[] = "/tmp/recorder_wd_recon_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-    unlink (path);
-
-    /* Simulate first session: write baseline + one diff */
-    json_t *cache1 = NULL;
-    json_t *s1 = json_object ();
-    json_object_set_new (s1, "key", json_string ("v1"));
-    CU_ASSERT_EQUAL (write_diff (s1, path, &cache1), 0);
-
-    json_t *s2 = json_object ();
-    json_object_set_new (s2, "key", json_string ("v2"));
-    CU_ASSERT_EQUAL (write_diff (s2, path, &cache1), 0);
-    json_decref (cache1);
-
-    /* Simulate restart: new cache, same file */
-    json_t *cache2 = NULL;
-    json_t *s3 = json_object ();
-    json_object_set_new (s3, "key", json_string ("v3"));
-    CU_ASSERT_EQUAL (write_diff (s3, path, &cache2), 0);
-
-    /* Verify: baseline=v1, diffs=[v2_change, v3_change] */
-    json_error_t error;
-    json_t *storage = json_load_file (path, 0, &error);
-    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
-
-    CU_ASSERT_STRING_EQUAL (json_string_value
-                            (json_object_get
-                             (json_object_get (storage, "baseline"), "key")), "v1");
-
-    json_t *diffs = json_object_get (storage, "diffs");
-    CU_ASSERT_EQUAL (json_array_size (diffs), 2);
-
-    /* The second diff should have v3 as the new value */
-    json_t *last_changes = json_object_get (json_array_get (diffs, 1), "changes");
-    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (last_changes, "key")),
-                            "v3");
-
-    json_decref (storage);
-    json_decref (s1);
-    json_decref (s2);
-    json_decref (s3);
-    json_decref (cache2);
-    unlink (path);
-}
-
-void
-test_read_last_poll_timestamp_reads_from_diffs ()
-{
-    char path[] = "/tmp/recorder_ts_diffs_XXXXXX";
-    int fd = mkstemp (path);
-    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
-    close (fd);
-
-    /* Write file with a diff entry that has a known timestamp */
-    json_t *diff_entry = json_object ();
-    json_object_set_new (diff_entry, "timestamp", json_integer (9999));
-    json_object_set_new (diff_entry, "changes", json_object ());
-    json_t *diffs_arr = json_array ();
-    json_array_append_new (diffs_arr, diff_entry);
-
-    json_t *storage = json_object ();
-    json_object_set_new (storage, "baseline_timestamp", json_integer (1000));
-    json_object_set_new (storage, "baseline", json_object ());
-    json_object_set_new (storage, "diffs", diffs_arr);
-    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, 0), 0);
-    json_decref (storage);
-
-    time_t result = read_last_poll_timestamp (path);
-    CU_ASSERT_EQUAL (result, 9999);
-
-    unlink (path);
-}
-
-
 int
 main (int argc, char *argv[])
 {
     int opt;
     const char *config_dir = NULL;
     bool unit_test = false;
-    CU_pSuite pSuite;
     GMainLoop *main_loop = NULL;
 
     while ((opt = getopt (argc, argv, "huc:l::")) != -1)
@@ -1959,108 +1160,9 @@ main (int argc, char *argv[])
         }
     }
 
-
     if (unit_test)
     {
-        CU_initialize_registry ();
-
-        pSuite = CU_add_suite ("unit::compare_json_deep", NULL, NULL);
-        CU_add_test (pSuite, "both_null_returns_null",
-                     test_compare_json_deep_both_null_returns_null);
-        CU_add_test (pSuite, "current_null_returns_json_null",
-                     test_compare_json_deep_current_null_returns_json_null);
-        CU_add_test (pSuite, "previous_null_returns_current_value",
-                     test_compare_json_deep_previous_null_returns_current_value);
-        CU_add_test (pSuite, "type_mismatch_returns_current_value",
-                     test_compare_json_deep_type_mismatch_returns_current_value);
-        CU_add_test (pSuite, "equal_string_returns_null",
-                     test_compare_json_deep_equal_string_returns_null);
-        CU_add_test (pSuite, "equal_integer_returns_null",
-                     test_compare_json_deep_equal_integer_returns_null);
-        CU_add_test (pSuite, "different_string_returns_current_value",
-                     test_compare_json_deep_different_string_returns_current_value);
-        CU_add_test (pSuite, "different_integer_returns_current_value",
-                     test_compare_json_deep_different_integer_returns_current_value);
-        CU_add_test (pSuite, "equal_arrays_returns_null",
-                     test_compare_json_deep_equal_arrays_returns_null);
-        CU_add_test (pSuite, "different_arrays_returns_current_array",
-                     test_compare_json_deep_different_arrays_returns_current_array);
-
-        pSuite = CU_add_suite ("integration::compare_json_deep_objects", NULL, NULL);
-        CU_add_test (pSuite, "empty_objects_returns_null",
-                     test_compare_json_deep_empty_objects_returns_null);
-        CU_add_test (pSuite, "equal_object_values_returns_null",
-                     test_compare_json_deep_equal_object_values_returns_null);
-        CU_add_test (pSuite, "changed_object_value_returns_current_value_object",
-                     test_compare_json_deep_changed_object_value_returns_current_value_object);
-        CU_add_test (pSuite, "deleted_key_records_null_marker",
-                     test_compare_json_deep_deleted_key_records_null_marker);
-        CU_add_test (pSuite, "new_key_returns_current_value",
-                     test_compare_json_deep_new_key_returns_current_value);
-
-        pSuite = CU_add_suite ("unit::reload_timing", NULL, NULL);
-        CU_add_test (pSuite, "missing_timestamp_returns_frequency",
-                     test_calculate_initial_delay_at_missing_timestamp_returns_frequency);
-        CU_add_test (pSuite, "future_timestamp_returns_frequency",
-                     test_calculate_initial_delay_at_future_timestamp_returns_frequency);
-        CU_add_test (pSuite, "overdue_returns_immediate",
-                     test_calculate_initial_delay_at_overdue_returns_immediate);
-        CU_add_test (pSuite, "partial_interval_returns_remaining",
-                     test_calculate_initial_delay_at_partial_interval_returns_remaining);
-        CU_add_test (pSuite, "missing_file_returns_zero",
-                     test_read_last_poll_timestamp_missing_file_returns_zero);
-        CU_add_test (pSuite, "valid_file_returns_value",
-                     test_read_last_poll_timestamp_valid_file_returns_value);
-        CU_add_test (pSuite, "non_integer_returns_zero",
-                     test_read_last_poll_timestamp_non_integer_returns_zero);
-        CU_add_test (pSuite, "reads_timestamp_from_last_diff",
-                     test_read_last_poll_timestamp_reads_from_diffs);
-
-        pSuite = CU_add_suite ("unit::apply_forward_diff", NULL, NULL);
-        CU_add_test (pSuite, "null_changes_returns_copy",
-                     test_apply_forward_diff_null_changes_returns_copy);
-        CU_add_test (pSuite, "empty_changes_returns_copy",
-                     test_apply_forward_diff_empty_changes_returns_copy);
-        CU_add_test (pSuite, "updates_existing_key",
-                     test_apply_forward_diff_updates_existing_key);
-        CU_add_test (pSuite, "adds_new_key", test_apply_forward_diff_adds_new_key);
-        CU_add_test (pSuite, "null_value_deletes_key",
-                     test_apply_forward_diff_null_value_deletes_key);
-        CU_add_test (pSuite, "nested_object_merges",
-                     test_apply_forward_diff_nested_object_merges);
-
-        pSuite = CU_add_suite ("unit::reconstruct_latest_snapshot", NULL, NULL);
-        CU_add_test (pSuite, "no_diffs_returns_baseline",
-                     test_reconstruct_no_diffs_returns_baseline);
-        CU_add_test (pSuite, "single_diff_applies", test_reconstruct_single_diff_applies);
-        CU_add_test (pSuite, "multiple_diffs_in_order",
-                     test_reconstruct_multiple_diffs_applies_in_order);
-        CU_add_test (pSuite, "diff_with_deletion", test_reconstruct_diff_with_deletion);
-
-        pSuite = CU_add_suite ("unit::append_diff_entry_to_file", NULL, NULL);
-        CU_add_test (pSuite, "appends_to_empty_array", test_append_diff_to_empty_array);
-        CU_add_test (pSuite, "appends_to_nonempty_array",
-                     test_append_diff_to_nonempty_array);
-        CU_add_test (pSuite, "nonexistent_file_fails",
-                     test_append_diff_nonexistent_file_fails);
-
-        pSuite = CU_add_suite ("integration::write_diff", NULL, NULL);
-        CU_add_test (pSuite, "creates_baseline_on_new_file",
-                     test_write_diff_creates_baseline_on_new_file);
-        CU_add_test (pSuite, "appends_empty_diff_when_unchanged",
-                     test_write_diff_appends_empty_diff_when_unchanged);
-        CU_add_test (pSuite, "records_changes", test_write_diff_records_changes);
-        CU_add_test (pSuite, "multiple_polls_accumulates",
-                     test_write_diff_multiple_polls_accumulates_diffs);
-        CU_add_test (pSuite, "reconstructs_from_existing_file",
-                     test_write_diff_reconstruct_from_existing_file);
-
-        CU_basic_set_mode (CU_BRM_VERBOSE);
-        CU_basic_run_tests ();
-        int failures = CU_get_number_of_failures ();
-        CU_cleanup_registry ();
-
-        return failures ? -1 : 0;
+        return run_tests ();
     }
 
     if (!config_dir)
@@ -2083,6 +1185,7 @@ main (int argc, char *argv[])
     g_unix_signal_add (SIGINT, quit_loop_cb, main_loop);
     g_unix_signal_add (SIGTERM, quit_loop_cb, main_loop);
     g_unix_signal_add (SIGHUP, reload_handler, (gpointer) config_dir);
+    g_unix_signal_add (SIGUSR1, force_poll_handler, NULL);
     g_main_loop_run (main_loop);
 
 
