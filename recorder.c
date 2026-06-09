@@ -46,6 +46,7 @@ typedef struct _config_data
 
 static GHashTable *destination_registry = NULL;
 static GPtrArray *active_configs = NULL;
+static GMainLoop *main_loop = NULL;
 
 /* Used to convert apteryx result into regular JSON */
 json_t *
@@ -996,13 +997,6 @@ load_configs_from_directory (const char *config_dir,
 
     free (absolute_config_dir);
     closedir (dir);
-
-    if (configs->len == 0)
-    {
-        fprintf (stderr, "error: no valid .json config files found in directory: %s\n",
-                 config_dir);
-        return -1;
-    }
     return 0;
 }
 
@@ -1038,6 +1032,22 @@ replace_active_configs (const char *config_dir)
     if (load_config_set (config_dir, &new_registry, &new_configs) != 0)
     {
         return -1;
+    }
+
+    if (new_configs && new_configs->len == 0)
+    {
+        /* No configuration files present, exit */
+        if (main_loop)
+        {
+            g_main_loop_quit (main_loop);
+            return 0;
+        }
+        else
+        {
+            fprintf (stderr, "error: No configuration files found in %s\n", config_dir);
+            free_config_set (new_registry, new_configs);
+            return -1;
+        }
     }
 
     stop_config_set (active_configs);
@@ -1931,7 +1941,6 @@ main (int argc, char *argv[])
     const char *config_dir = NULL;
     bool unit_test = false;
     CU_pSuite pSuite;
-    GMainLoop *main_loop = NULL;
 
     while ((opt = getopt (argc, argv, "huc:l::")) != -1)
     {
