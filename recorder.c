@@ -337,6 +337,10 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
                                          JSON_INDENT (json_indent));
             json_decref (new_storage);
 
+            if (*last_snapshot_cache)
+            {
+                json_decref (*last_snapshot_cache);
+            }
             *last_snapshot_cache = json_deep_copy (current_json);
             return error_code;
         }
@@ -461,6 +465,7 @@ create_logrotate_config (config_data *config)
         fprintf (stderr, "error: failed to build logrotate config path\n");
         free (absolute_path);
         free (config_name);
+        free (config_path);
         free (directory_to_write);
         return -1;
     }
