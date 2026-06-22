@@ -1906,6 +1906,42 @@ test_write_diff_reconstruct_from_existing_file ()
 }
 
 void
+test_write_diff_replaces_existing_cache_when_file_missing ()
+{
+    char path[] = "/tmp/recorder_wd_replace_cache_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *old_cache = json_object ();
+    json_object_set_new (old_cache, "key", json_string ("old"));
+
+    /* Hold a second reference so old_cache remains valid for assertions. */
+    json_incref (old_cache);
+    json_t *cache = old_cache;
+
+    json_t *current = json_object ();
+    json_object_set_new (current, "key", json_string ("new"));
+
+    CU_ASSERT_EQUAL (write_diff (current, path, &cache), 0);
+    CU_ASSERT_PTR_NOT_NULL (cache);
+    CU_ASSERT_PTR_NOT_EQUAL (cache, old_cache);
+    CU_ASSERT_TRUE (json_equal (cache, current));
+
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+    CU_ASSERT_TRUE (json_equal (json_object_get (storage, "baseline"), current));
+
+    json_decref (storage);
+    json_decref (current);
+    json_decref (cache);
+    json_decref (old_cache);
+    unlink (path);
+}
+
+void
 test_read_last_poll_timestamp_reads_from_diffs ()
 {
     char path[] = "/tmp/recorder_ts_diffs_XXXXXX";
@@ -2063,6 +2099,8 @@ main (int argc, char *argv[])
                      test_write_diff_multiple_polls_accumulates_diffs);
         CU_add_test (pSuite, "reconstructs_from_existing_file",
                      test_write_diff_reconstruct_from_existing_file);
+        CU_add_test (pSuite, "replaces_existing_cache_when_file_missing",
+                     test_write_diff_replaces_existing_cache_when_file_missing);
 
         CU_basic_set_mode (CU_BRM_VERBOSE);
         CU_basic_run_tests ();
