@@ -61,7 +61,18 @@ gnode_to_json (const GNode *node)
     for (const GNode *child = node->children; child; child = child->next)
     {
         json_t *child_json = NULL;
-        if (APTERYX_HAS_VALUE (child))
+        /* Convert the direct children of an entity into an object*/
+        if (strcmp ((const char *) node->data, "entities") == 0 &&
+            APTERYX_HAS_VALUE (child) && !child->children)
+        {
+            const char *marker = APTERYX_VALUE (child);
+            child_json = json_object ();
+            if (marker && *marker)
+            {
+                json_object_set_new (child_json, marker, json_object ());
+            }
+        }
+        else if (APTERYX_HAS_VALUE (child))
         {
             child_json = json_string (APTERYX_VALUE (child));
         }
