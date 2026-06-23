@@ -482,8 +482,9 @@ create_logrotate_config (config_data *config)
     }
 
     fprintf (f, "%s {\n"
-             "    size %ldk\n"
+             "    size %ldM\n"
              "    rotate %d\n"
+             "    su root root\n"
              "    missingok\n"
              "    notifempty\n"
              "    nocreate\n" "}\n", absolute_path, config->max_size, config->max_samples);
