@@ -310,11 +310,17 @@ static int
 write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
 {
     int error_code;
-    json_error_t error;
-    json_t *storage = json_load_file (path_to_diff, 0, &error);
 
-    if (!*last_snapshot_cache || !storage)
+    /* Only read and parse the diff file when the in-memory snapshot is empty
+     * (the first poll after startup or a SIGHUP reload). In steady state the
+     * cache already holds the latest snapshot, so re-parsing the whole diff
+     * file every poll would needlessly grow memory and CPU usage as the file
+     * accumulates entries over a long run.
+     */
+    if (!*last_snapshot_cache)
     {
+        json_error_t error;
+        json_t *storage = json_load_file (path_to_diff, 0, &error);
         if (storage)
         {
             // Reconstruct latest state from existing file. Likely a SIGHUP reload
@@ -322,28 +328,30 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
             json_t *diffs = json_object_get (storage, "diffs");
             *last_snapshot_cache = reconstruct_latest_snapshot (baseline, diffs);
             json_decref (storage);
-            storage = NULL;
         }
-        else
+    }
+
+    /* If this is the first sample or the destination file
+     * has been rotated write a baseline from the current state
+     */
+    if (!*last_snapshot_cache || access (path_to_diff, F_OK) != 0)
+    {
+        json_t *new_storage = json_object ();
+        json_object_set_new (new_storage, "baseline_timestamp",
+                             json_integer (time (NULL)));
+        json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
+        json_object_set_new (new_storage, "diffs", json_array ());
+
+        error_code = json_dump_file (new_storage, path_to_diff,
+                                     JSON_INDENT (json_indent));
+        json_decref (new_storage);
+
+        if (*last_snapshot_cache)
         {
-            // No existing file: write baseline and set cache to current state
-            json_t *new_storage = json_object ();
-            json_object_set_new (new_storage, "baseline_timestamp",
-                                 json_integer (time (NULL)));
-            json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
-            json_object_set_new (new_storage, "diffs", json_array ());
-
-            error_code = json_dump_file (new_storage, path_to_diff,
-                                         JSON_INDENT (json_indent));
-            json_decref (new_storage);
-
-            if (*last_snapshot_cache)
-            {
-                json_decref (*last_snapshot_cache);
-            }
-            *last_snapshot_cache = json_deep_copy (current_json);
-            return error_code;
+            json_decref (*last_snapshot_cache);
         }
+        *last_snapshot_cache = json_deep_copy (current_json);
+        return error_code;
     }
 
     json_t *changes = compare_json_deep (current_json, *last_snapshot_cache);
@@ -359,11 +367,6 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
     {
         json_decref (*last_snapshot_cache);
         *last_snapshot_cache = json_deep_copy (current_json);
-    }
-
-    if (storage)
-    {
-        json_decref (storage);
     }
 
     return error_code;
