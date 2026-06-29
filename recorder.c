@@ -305,12 +305,28 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
     return 0;
 }
 
+/* Writes a full snapshot (baseline + empty diffs) to path_to_diff and updates the cache */
+static int
+write_snapshot (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
+{
+    json_t *new_storage = json_object ();
+    json_object_set_new (new_storage, "baseline_timestamp", json_integer (time (NULL)));
+    json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
+    json_object_set_new (new_storage, "diffs", json_array ());
+
+    int error_code = json_dump_file (new_storage, path_to_diff, JSON_INDENT (json_indent));
+    json_decref (new_storage);
+
+    if (*last_snapshot_cache)
+        json_decref (*last_snapshot_cache);
+    *last_snapshot_cache = json_deep_copy (current_json);
+    return error_code;
+}
+
 /* Edits (or creates) JSON diff file. Uses an in-memory cache to optimise calculations */
 static int
 write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
 {
-    int error_code;
-
     /* Only read and parse the diff file when the in-memory snapshot is empty
      * (the first poll after startup or a SIGHUP reload). In steady state the
      * cache already holds the latest snapshot, so re-parsing the whole diff
@@ -336,22 +352,7 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
      */
     if (!*last_snapshot_cache || access (path_to_diff, F_OK) != 0)
     {
-        json_t *new_storage = json_object ();
-        json_object_set_new (new_storage, "baseline_timestamp",
-                             json_integer (time (NULL)));
-        json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
-        json_object_set_new (new_storage, "diffs", json_array ());
-
-        error_code = json_dump_file (new_storage, path_to_diff,
-                                     JSON_INDENT (json_indent));
-        json_decref (new_storage);
-
-        if (*last_snapshot_cache)
-        {
-            json_decref (*last_snapshot_cache);
-        }
-        *last_snapshot_cache = json_deep_copy (current_json);
-        return error_code;
+        return write_snapshot (current_json, path_to_diff, last_snapshot_cache);
     }
 
     json_t *changes = compare_json_deep (current_json, *last_snapshot_cache);
@@ -360,16 +361,24 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
     json_object_set_new (diff_entry, "timestamp", json_integer (time (NULL)));
     json_object_set_new (diff_entry, "changes", changes ? changes : json_object ());
 
-    error_code = append_diff_entry_to_file (path_to_diff, diff_entry);
+    int error_code = append_diff_entry_to_file (path_to_diff, diff_entry);
     json_decref (diff_entry);
 
-    if (error_code == 0 && changes != NULL) // Only update if there were valid changes
+    /* If appending failed the file was likely rotated to an empty/unreadable file.
+     * Fall back to writing a full snapshot so we don't lose the current state.
+     */
+    if (error_code != 0)
+    {
+        return write_snapshot (current_json, path_to_diff, last_snapshot_cache);
+    }
+
+    if (changes != NULL) // Only update cache if there were actual changes
     {
         json_decref (*last_snapshot_cache);
         *last_snapshot_cache = json_deep_copy (current_json);
     }
 
-    return error_code;
+    return 0;
 }
 
 
@@ -1951,6 +1960,54 @@ test_write_diff_replaces_existing_cache_when_file_missing ()
 }
 
 void
+test_write_diff_writes_snapshot_on_rotated_file ()
+{
+    char path[] = "/tmp/recorder_wd_rotated_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    /* Establish a baseline and one diff */
+    json_t *cache = NULL;
+    json_t *s1 = json_object ();
+    json_object_set_new (s1, "key", json_string ("v1"));
+    CU_ASSERT_EQUAL (write_diff (s1, path, &cache), 0);
+
+    json_t *s2 = json_object ();
+    json_object_set_new (s2, "key", json_string ("v2"));
+    CU_ASSERT_EQUAL (write_diff (s2, path, &cache), 0);
+
+    /* Simulate rotation: replace the file with an empty file */
+    FILE *rotated = fopen (path, "w");
+    CU_ASSERT_PTR_NOT_NULL_FATAL (rotated);
+    fclose (rotated);
+
+    /* write_diff should detect the append failure and write a fresh snapshot */
+    json_t *s3 = json_object ();
+    json_object_set_new (s3, "key", json_string ("v3"));
+    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
+
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    /* New baseline should be the snapshot at the time of rotation */
+    CU_ASSERT_STRING_EQUAL (
+        json_string_value (json_object_get (json_object_get (storage, "baseline"), "key")),
+        "v3");
+    CU_ASSERT_EQUAL (json_array_size (json_object_get (storage, "diffs")), 0);
+    CU_ASSERT_TRUE (json_equal (cache, s3));
+
+    json_decref (storage);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
 test_read_last_poll_timestamp_reads_from_diffs ()
 {
     char path[] = "/tmp/recorder_ts_diffs_XXXXXX";
@@ -2110,6 +2167,8 @@ main (int argc, char *argv[])
                      test_write_diff_reconstruct_from_existing_file);
         CU_add_test (pSuite, "replaces_existing_cache_when_file_missing",
                      test_write_diff_replaces_existing_cache_when_file_missing);
+        CU_add_test (pSuite, "writes_snapshot_on_rotated_file",
+                     test_write_diff_writes_snapshot_on_rotated_file);
 
         CU_basic_set_mode (CU_BRM_VERBOSE);
         CU_basic_run_tests ();
