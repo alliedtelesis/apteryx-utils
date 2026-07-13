@@ -192,7 +192,9 @@ apply_forward_diff (json_t *snapshot, json_t *changes)
     return result;
 }
 
-/* Rebuilds the latest snapshot from a baseline + array of forward diffs */
+/* Rebuilds the latest snapshot from a baseline + array of forward diffs.
+ * Retained as the streaming reconstruction's test oracle; production code now
+ * uses stream_read_record() instead. */
 static json_t *
 reconstruct_latest_snapshot (json_t *baseline, json_t *diffs)
 {
@@ -208,6 +210,234 @@ reconstruct_latest_snapshot (json_t *baseline, json_t *diffs)
     }
 
     return snapshot;
+}
+
+/* Outcome of streaming the record file. */
+typedef enum
+{
+    RECON_OK,       /* Parsed cleanly; the diffs array closed with ']' */
+    RECON_CORRUPT,  /* Truncated: EOF/parse error before the closing ']'.
+                     * Any reconstructed snapshot still holds every fully-parsed
+                     * diff, so the caller should preserve it and repair the file. */
+    RECON_ERROR     /* Unrecoverable: file missing, or no/corrupt baseline */
+} recon_status;
+
+/* Advances the stream to the value of a top-level key. quoted_key must include
+ * the surrounding quotes, e.g. "\"baseline\"", so a match cannot occur inside a
+ * longer key such as "baseline_timestamp". On success the stream is left just
+ * after the key's ':' (json_loadf skips any remaining leading whitespace).
+ *
+ * Ordering assumption: scan for "baseline" from the start of the file, and for
+ * "diffs" only after the baseline value has been consumed, so a nested key of
+ * the same name inside the snapshot cannot be matched by accident.
+ *
+ * Returns 0 on success, -1 on EOF before a match or a missing ':'. */
+static int
+stream_advance_to_top_key (FILE *f, const char *quoted_key)
+{
+    size_t key_len = strlen (quoted_key);
+    size_t matched = 0;
+    int c;
+
+    while ((c = fgetc (f)) != EOF)
+    {
+        if (c == quoted_key[matched])
+        {
+            matched++;
+            if (matched == key_len)
+            {
+                while ((c = fgetc (f)) != EOF && isspace (c));
+                return (c == ':') ? 0 : -1;
+            }
+        }
+        else
+        {
+            /* Restart, but let the current char begin a new match */
+            matched = ((char) c == quoted_key[0]) ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
+/* Reads an integer value at the current stream position (skipping leading
+ * whitespace), leaving the stream positioned on the following byte. Uses a
+ * manual scan rather than json_loadf: jansson's scalar lookahead would consume
+ * (and lose) a byte past the number. Returns TRUE and sets *out on success. */
+static gboolean
+stream_read_integer_value (FILE *f, long *out)
+{
+    int c;
+    while ((c = fgetc (f)) != EOF && isspace (c));
+
+    gboolean negative = (c == '-');
+    if (negative)
+    {
+        c = fgetc (f);
+    }
+    if (!isdigit (c))
+    {
+        return FALSE;
+    }
+
+    long value = 0;
+    do
+    {
+        value = value * 10 + (c - '0');
+        c = fgetc (f);
+    }
+    while (isdigit (c));
+
+    if (c != EOF)
+    {
+        ungetc (c, f);
+    }
+    *out = negative ? -value : value;
+    return TRUE;
+}
+
+/* Streams the record file, reconstructing the latest snapshot and/or reading the
+ * last timestamp without loading the whole file into memory: the baseline plus
+ * at most one diff entry are held live at any time.
+ *
+ * Relies on json_loadf(JSON_DISABLE_EOF_CHECK) leaving the stream positioned
+ * immediately after the parsed value. This is only reliable for values ending in
+ * a single-character token (an object '}' or array ']'); jansson uses one-char
+ * lookahead for scalars and would lose a byte. Every json_loadf call here is
+ * therefore on an object (the baseline, each diff entry); scalars are read with
+ * stream_read_integer_value. Do not json_loadf a scalar value here.
+ *
+ * want_snapshot: if TRUE, *out_snapshot receives the reconstructed snapshot
+ *   (caller owns it; only written when a baseline was parsed).
+ * out_last_ts: if non-NULL, receives the last diff's timestamp (or the
+ *   baseline_timestamp if there are no diffs, or 0). */
+static recon_status
+stream_read_record (const char *path, gboolean want_snapshot,
+                    json_t **out_snapshot, time_t *out_last_ts)
+{
+    FILE *f = fopen (path, "r");
+    if (!f)
+    {
+        return RECON_ERROR;
+    }
+
+    json_error_t error;
+    json_t *snapshot = NULL;
+    int c;
+
+    if (out_last_ts)
+    {
+        *out_last_ts = 0;
+        long ts = 0;
+        if (stream_advance_to_top_key (f, "\"baseline_timestamp\"") == 0 &&
+            stream_read_integer_value (f, &ts))
+        {
+            *out_last_ts = (time_t) ts;
+        }
+        rewind (f);
+    }
+
+    if (stream_advance_to_top_key (f, "\"baseline\"") != 0)
+    {
+        fclose (f);
+        return RECON_ERROR;
+    }
+
+    json_t *baseline = json_loadf (f, JSON_DISABLE_EOF_CHECK, &error);
+    if (!baseline)
+    {
+        fclose (f);
+        return RECON_ERROR;
+    }
+
+    if (want_snapshot)
+    {
+        snapshot = baseline;    /* adopt directly, no deep copy */
+    }
+    else
+    {
+        json_decref (baseline);
+    }
+
+    if (stream_advance_to_top_key (f, "\"diffs\"") != 0)
+    {
+        /* Truncated after the baseline */
+        if (want_snapshot)
+        {
+            *out_snapshot = snapshot;
+        }
+        fclose (f);
+        return RECON_CORRUPT;
+    }
+
+    while ((c = fgetc (f)) != EOF && isspace (c));
+    if (c != '[')
+    {
+        if (want_snapshot)
+        {
+            *out_snapshot = snapshot;
+        }
+        fclose (f);
+        return RECON_CORRUPT;
+    }
+
+    recon_status status = RECON_CORRUPT;    /* until we see the closing ']' */
+    for (;;)
+    {
+        while ((c = fgetc (f)) != EOF && isspace (c));
+        if (c == EOF)
+        {
+            status = RECON_CORRUPT;         /* no closing ']' */
+            break;
+        }
+        if (c == ']')
+        {
+            status = RECON_OK;
+            break;
+        }
+        if (c == ',')
+        {
+            continue;
+        }
+        if (c != '{')
+        {
+            status = RECON_CORRUPT;
+            break;
+        }
+
+        ungetc (c, f);
+        json_t *entry = json_loadf (f, JSON_DISABLE_EOF_CHECK, &error);
+        if (!entry)
+        {
+            status = RECON_CORRUPT;         /* truncated mid-entry */
+            break;
+        }
+
+        if (out_last_ts)
+        {
+            json_t *ts = json_object_get (entry, "timestamp");
+            if (json_is_integer (ts))
+            {
+                *out_last_ts = (time_t) json_integer_value (ts);
+            }
+        }
+
+        if (want_snapshot)
+        {
+            json_t *changes = json_object_get (entry, "changes");
+            json_t *next = apply_forward_diff (snapshot, changes);
+            json_decref (snapshot);
+            snapshot = next;
+        }
+
+        json_decref (entry);                /* freed before the next read */
+    }
+
+    if (want_snapshot)
+    {
+        *out_snapshot = snapshot;
+    }
+    fclose (f);
+    return status;
 }
 
 /* Appends a single entry to the diffs array via seek, minimising disk write */
@@ -305,17 +535,27 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
     return 0;
 }
 
+/* Writes a well-terminated record file: a fresh baseline (== baseline_state)
+ * with an empty diffs array. Does not touch any cache, so it can be used both to
+ * write a new snapshot and to repair a truncated file from a recovered state. */
+static int
+write_baseline_file (json_t *baseline_state, const char *path)
+{
+    json_t *new_storage = json_object ();
+    json_object_set_new (new_storage, "baseline_timestamp", json_integer (time (NULL)));
+    json_object_set_new (new_storage, "baseline", json_deep_copy (baseline_state));
+    json_object_set_new (new_storage, "diffs", json_array ());
+
+    int error_code = json_dump_file (new_storage, path, JSON_INDENT (json_indent));
+    json_decref (new_storage);
+    return error_code;
+}
+
 /* Writes a full snapshot (baseline + empty diffs) to path_to_diff and updates the cache */
 static int
 write_snapshot (json_t *current_json, const char *path_to_diff, json_t **last_snapshot_cache)
 {
-    json_t *new_storage = json_object ();
-    json_object_set_new (new_storage, "baseline_timestamp", json_integer (time (NULL)));
-    json_object_set_new (new_storage, "baseline", json_deep_copy (current_json));
-    json_object_set_new (new_storage, "diffs", json_array ());
-
-    int error_code = json_dump_file (new_storage, path_to_diff, JSON_INDENT (json_indent));
-    json_decref (new_storage);
+    int error_code = write_baseline_file (current_json, path_to_diff);
 
     if (*last_snapshot_cache)
         json_decref (*last_snapshot_cache);
@@ -332,18 +572,26 @@ write_diff (json_t *current_json, const char *path_to_diff, json_t **last_snapsh
      * cache already holds the latest snapshot, so re-parsing the whole diff
      * file every poll would needlessly grow memory and CPU usage as the file
      * accumulates entries over a long run.
+     *
+     * Stream the file (baseline, then one diff at a time) rather than loading it
+     * all at once, keeping peak memory to roughly the snapshot plus one diff. If
+     * the file is truncated (e.g. the process was killed mid-append, leaving the
+     * closing ']'/'}' unwritten) keep every fully-parsed diff and repair the
+     * file to a well-terminated form, rather than discarding the history.
      */
-    if (!*last_snapshot_cache)
+    if (!*last_snapshot_cache && access (path_to_diff, F_OK) == 0)
     {
-        json_error_t error;
-        json_t *storage = json_load_file (path_to_diff, 0, &error);
-        if (storage)
+        json_t *recon = NULL;
+        recon_status st = stream_read_record (path_to_diff, TRUE, &recon, NULL);
+        if (recon)
         {
-            // Reconstruct latest state from existing file. Likely a SIGHUP reload
-            json_t *baseline = json_object_get (storage, "baseline");
-            json_t *diffs = json_object_get (storage, "diffs");
-            *last_snapshot_cache = reconstruct_latest_snapshot (baseline, diffs);
-            json_decref (storage);
+            *last_snapshot_cache = recon;
+            if (st == RECON_CORRUPT)
+            {
+                /* Rewrite a valid file (baseline == recovered state) so the
+                 * append below can rely on a well-formed trailing ']'/'}'. */
+                write_baseline_file (recon, path_to_diff);
+            }
         }
     }
 
@@ -592,30 +840,12 @@ calculate_initial_delay_at (long frequency, time_t last_poll_timestamp, time_t n
 static time_t
 read_last_poll_timestamp (const char *path_to_diff)
 {
-    json_error_t error;
-    json_t *storage = json_load_file (path_to_diff, 0, &error);
-    if (!storage)
-    {
-        return 0;
-    }
-
-    json_t *diffs = json_object_get (storage, "diffs");
-    size_t diffs_len = json_is_array (diffs) ? json_array_size (diffs) : 0;
-
-    if (diffs_len > 0)
-    {
-        json_t *last_diff = json_array_get (diffs, diffs_len - 1);
-        json_t *ts = json_object_get (last_diff, "timestamp");
-        time_t result = json_is_integer (ts) ? (time_t) json_integer_value (ts) : 0;
-        json_decref (storage);
-        return result;
-    }
-
-    json_t *ts = json_object_get (storage, "baseline_timestamp");
-    time_t result = json_is_integer (ts) ? (time_t) json_integer_value (ts) : 0;
-
-    json_decref (storage);
-    return result;
+    /* Stream the file rather than loading it all: we only need the last
+     * timestamp. On a truncated file this returns the last complete entry's
+     * timestamp (or the baseline_timestamp), never a partial/garbage value. */
+    time_t ts = 0;
+    stream_read_record (path_to_diff, FALSE, NULL, &ts);
+    return ts;
 }
 
 /* Setup for the GLib thread */
@@ -2035,6 +2265,262 @@ test_read_last_poll_timestamp_reads_from_diffs ()
     unlink (path);
 }
 
+/* Test helper: simulate a file left unterminated by a killed append. Strips the
+ * trailing diffs-array ']' and object '}' back to the end of the last complete
+ * entry, so the baseline and every complete diff remain but the terminators are
+ * gone. If chop_extra > 0, cut that many further bytes to truncate mid-entry. */
+static void
+truncate_record_terminators (const char *path, long chop_extra)
+{
+    FILE *f = fopen (path, "r+");
+    CU_ASSERT_PTR_NOT_NULL_FATAL (f);
+    fseek (f, 0, SEEK_END);
+    long size = ftell (f);
+    char *buf = malloc (size + 1);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (buf);
+    fseek (f, 0, SEEK_SET);
+    size_t rd = fread (buf, 1, size, f);
+    (void) rd;
+
+    /* Find the closing ']' of the diffs array (last ']' in the file), then the
+     * last entry's closing '}' just before it. */
+    long i = size - 1;
+    while (i >= 0 && buf[i] != ']')
+        i--;
+    long j = (i >= 0) ? i - 1 : size - 1;
+    while (j >= 0 && buf[j] != '}')
+        j--;
+    long newlen = (j >= 0) ? j + 1 : 0;
+    free (buf);
+
+    newlen -= chop_extra;
+    if (newlen < 0)
+        newlen = 0;
+
+    CU_ASSERT_EQUAL_FATAL (ftruncate (fileno (f), newlen), 0);
+    fclose (f);
+}
+
+/* Builds a record file (baseline s1, then a diff to s2, then a diff to s3) using
+ * the production write path, then decrefs the caller's states. Leaves the file
+ * on disk at `path`. */
+static void
+build_three_state_record (const char *path, json_t *s1, json_t *s2, json_t *s3)
+{
+    json_t *cache = NULL;
+    CU_ASSERT_EQUAL (write_diff (s1, path, &cache), 0);
+    CU_ASSERT_EQUAL (write_diff (s2, path, &cache), 0);
+    CU_ASSERT_EQUAL (write_diff (s3, path, &cache), 0);
+    json_decref (cache);
+}
+
+void
+test_stream_reconstruct_equals_old_reconstruction ()
+{
+    char path[] = "/tmp/recorder_stream_eq_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    /* s1 -> s2 changes a nested value; s2 -> s3 deletes a key */
+    json_t *s1 = json_pack ("{s:s, s:s, s:{s:s}}", "a", "1", "b", "2", "nested", "x", "1");
+    json_t *s2 = json_pack ("{s:s, s:s, s:{s:s}}", "a", "1", "b", "2", "nested", "x", "2");
+    json_t *s3 = json_pack ("{s:s, s:{s:s}}", "a", "1", "nested", "x", "2");
+    build_three_state_record (path, s1, s2, s3);
+
+    /* Streaming reconstruction */
+    json_t *streamed = NULL;
+    recon_status st = stream_read_record (path, TRUE, &streamed, NULL);
+    CU_ASSERT_EQUAL (st, RECON_OK);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (streamed);
+
+    /* Oracle: whole-file load + reconstruct_latest_snapshot */
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+    json_t *oracle = reconstruct_latest_snapshot (json_object_get (storage, "baseline"),
+                                                  json_object_get (storage, "diffs"));
+
+    CU_ASSERT_TRUE (json_equal (streamed, oracle));
+    CU_ASSERT_TRUE (json_equal (streamed, s3));
+
+    json_decref (streamed);
+    json_decref (oracle);
+    json_decref (storage);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    unlink (path);
+}
+
+void
+test_stream_reconstruct_empty_diffs_returns_baseline ()
+{
+    char path[] = "/tmp/recorder_stream_empty_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    json_t *baseline = json_pack ("{s:s}", "key", "val");
+    json_t *storage = json_object ();
+    json_object_set_new (storage, "baseline_timestamp", json_integer (100));
+    json_object_set (storage, "baseline", baseline);
+    json_object_set_new (storage, "diffs", json_array ());
+    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
+    json_decref (storage);
+
+    json_t *streamed = NULL;
+    recon_status st = stream_read_record (path, TRUE, &streamed, NULL);
+    CU_ASSERT_EQUAL (st, RECON_OK);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (streamed);
+    CU_ASSERT_TRUE (json_equal (streamed, baseline));
+
+    json_decref (streamed);
+    json_decref (baseline);
+    unlink (path);
+}
+
+void
+test_stream_reconstruct_truncated_preserves_history ()
+{
+    char path[] = "/tmp/recorder_stream_trunc_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *s1 = json_pack ("{s:s}", "key", "v1");
+    json_t *s2 = json_pack ("{s:s}", "key", "v2");
+    json_t *s3 = json_pack ("{s:s}", "key", "v3");
+    build_three_state_record (path, s1, s2, s3);
+
+    /* Remove the closing ']'/'}' — as if killed after the last complete entry */
+    truncate_record_terminators (path, 0);
+
+    json_t *streamed = NULL;
+    recon_status st = stream_read_record (path, TRUE, &streamed, NULL);
+    CU_ASSERT_EQUAL (st, RECON_CORRUPT);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (streamed);
+    /* Both diffs applied: state == v3 (no history lost) */
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (streamed, "key")), "v3");
+
+    json_decref (streamed);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    unlink (path);
+}
+
+void
+test_stream_reconstruct_truncated_mid_entry ()
+{
+    char path[] = "/tmp/recorder_stream_midentry_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *s1 = json_pack ("{s:s}", "key", "v1");
+    json_t *s2 = json_pack ("{s:s}", "key", "v2");
+    json_t *s3 = json_pack ("{s:s}", "key", "v3");
+    build_three_state_record (path, s1, s2, s3);
+
+    /* Cut into the middle of the last (v3) entry: the last complete state is v2 */
+    truncate_record_terminators (path, 5);
+
+    json_t *streamed = NULL;
+    recon_status st = stream_read_record (path, TRUE, &streamed, NULL);
+    CU_ASSERT_EQUAL (st, RECON_CORRUPT);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (streamed);
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (streamed, "key")), "v2");
+
+    json_decref (streamed);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    unlink (path);
+}
+
+void
+test_write_diff_repairs_truncated_file ()
+{
+    char path[] = "/tmp/recorder_wd_repair_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+    unlink (path);
+
+    json_t *s1 = json_pack ("{s:s}", "key", "v1");
+    json_t *s2 = json_pack ("{s:s}", "key", "v2");
+    json_t *s3 = json_pack ("{s:s}", "key", "v3");
+    build_three_state_record (path, s1, s2, s3);
+
+    /* Corrupt: strip the terminators (simulates a crash mid-append) */
+    truncate_record_terminators (path, 0);
+
+    /* Restart with an empty cache and a new poll (v4). The old code would have
+     * overwritten the file with a fresh v4 baseline, losing v1..v3. */
+    json_t *cache = NULL;
+    json_t *s4 = json_pack ("{s:s}", "key", "v4");
+    CU_ASSERT_EQUAL (write_diff (s4, path, &cache), 0);
+
+    /* File is valid JSON again */
+    json_error_t error;
+    json_t *storage = json_load_file (path, 0, &error);
+    CU_ASSERT_PTR_NOT_NULL_FATAL (storage);
+
+    /* History preserved: repaired baseline is the recovered v3 state ... */
+    CU_ASSERT_STRING_EQUAL (
+        json_string_value (json_object_get (json_object_get (storage, "baseline"), "key")),
+        "v3");
+    /* ... and the new v4 sample was recorded as a diff onto it */
+    json_t *diffs = json_object_get (storage, "diffs");
+    CU_ASSERT_EQUAL (json_array_size (diffs), 1);
+    json_t *changes = json_object_get (json_array_get (diffs, 0), "changes");
+    CU_ASSERT_STRING_EQUAL (json_string_value (json_object_get (changes, "key")), "v4");
+    CU_ASSERT_TRUE (json_equal (cache, s4));
+
+    json_decref (storage);
+    json_decref (s1);
+    json_decref (s2);
+    json_decref (s3);
+    json_decref (s4);
+    json_decref (cache);
+    unlink (path);
+}
+
+void
+test_read_last_poll_timestamp_truncated_returns_last_complete ()
+{
+    char path[] = "/tmp/recorder_ts_trunc_XXXXXX";
+    int fd = mkstemp (path);
+    CU_ASSERT_NOT_EQUAL_FATAL (fd, -1);
+    close (fd);
+
+    /* Two complete diffs (ts 100 then 9999) written as a valid file */
+    json_t *d1 = json_pack ("{s:i, s:{}}", "timestamp", 100, "changes");
+    json_t *d2 = json_pack ("{s:i, s:{}}", "timestamp", 9999, "changes");
+    json_t *diffs = json_array ();
+    json_array_append_new (diffs, d1);
+    json_array_append_new (diffs, d2);
+
+    json_t *storage = json_object ();
+    json_object_set_new (storage, "baseline_timestamp", json_integer (50));
+    json_object_set_new (storage, "baseline", json_object ());
+    json_object_set_new (storage, "diffs", diffs);
+    CU_ASSERT_EQUAL_FATAL (json_dump_file (storage, path, JSON_INDENT (json_indent)), 0);
+    json_decref (storage);
+
+    /* Strip the terminators after the last complete entry */
+    truncate_record_terminators (path, 0);
+
+    /* Old code: whole-file load fails -> 0. New code: last complete ts = 9999 */
+    CU_ASSERT_EQUAL (read_last_poll_timestamp (path), 9999);
+
+    unlink (path);
+}
+
 
 int
 main (int argc, char *argv[])
@@ -2126,6 +2612,8 @@ main (int argc, char *argv[])
                      test_read_last_poll_timestamp_non_integer_returns_zero);
         CU_add_test (pSuite, "reads_timestamp_from_last_diff",
                      test_read_last_poll_timestamp_reads_from_diffs);
+        CU_add_test (pSuite, "truncated_returns_last_complete",
+                     test_read_last_poll_timestamp_truncated_returns_last_complete);
 
         pSuite = CU_add_suite ("unit::apply_forward_diff", NULL, NULL);
         CU_add_test (pSuite, "null_changes_returns_copy",
@@ -2148,6 +2636,16 @@ main (int argc, char *argv[])
                      test_reconstruct_multiple_diffs_applies_in_order);
         CU_add_test (pSuite, "diff_with_deletion", test_reconstruct_diff_with_deletion);
 
+        pSuite = CU_add_suite ("unit::stream_reconstruct", NULL, NULL);
+        CU_add_test (pSuite, "equals_old_reconstruction",
+                     test_stream_reconstruct_equals_old_reconstruction);
+        CU_add_test (pSuite, "empty_diffs_returns_baseline",
+                     test_stream_reconstruct_empty_diffs_returns_baseline);
+        CU_add_test (pSuite, "truncated_preserves_history",
+                     test_stream_reconstruct_truncated_preserves_history);
+        CU_add_test (pSuite, "truncated_mid_entry",
+                     test_stream_reconstruct_truncated_mid_entry);
+
         pSuite = CU_add_suite ("unit::append_diff_entry_to_file", NULL, NULL);
         CU_add_test (pSuite, "appends_to_empty_array", test_append_diff_to_empty_array);
         CU_add_test (pSuite, "appends_to_nonempty_array",
@@ -2169,6 +2667,8 @@ main (int argc, char *argv[])
                      test_write_diff_replaces_existing_cache_when_file_missing);
         CU_add_test (pSuite, "writes_snapshot_on_rotated_file",
                      test_write_diff_writes_snapshot_on_rotated_file);
+        CU_add_test (pSuite, "repairs_truncated_file",
+                     test_write_diff_repairs_truncated_file);
 
         CU_basic_set_mode (CU_BRM_VERBOSE);
         CU_basic_run_tests ();
