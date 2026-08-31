@@ -260,7 +260,7 @@ sync_path_excluded (sync_entry *entry, const char *path)
                 ret = strncmp (path, exclude_path, star_offset);
                 if (ret == 0)
                 {
-                    char *ptr = strchr (path + star_offset, '/');
+                    const char *ptr = strchr (path + star_offset, '/');
                     if (!ptr || strstr (ptr, star + 1) != ptr)
                     {
                         ret = -1;
