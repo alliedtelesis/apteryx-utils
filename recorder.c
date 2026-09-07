@@ -1107,6 +1107,11 @@ validate_destination (GHashTable *registry,
     }
 
     char *dest_str = strdup (destination_path);
+    if (!dest_str)
+    {
+        fprintf (stderr, "error: out of memory checking destination path\n");
+        return -1;
+    }
 
     if (make_path (dest_str) != 0)
     {
