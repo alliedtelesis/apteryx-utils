@@ -52,14 +52,25 @@ pthread_mutex_t config_lock = PTHREAD_MUTEX_INITIALIZER;
 static void
 _path_to_node (GNode *root, const char *path, const char *value)
 {
-    char *key = g_strdup (path);
-    char *key_start = key;
-    char *new_path = g_strdup (path);
-    char *new_path_start = new_path;
+    char *key;
+    char *key_start;
+    char *new_path;
+    char *new_path_start;
     GNode *old_current = root;
     GNode *current = root;
     GNode *node = NULL;
-    int path_length = strlen (key);
+    int path_length;
+
+    if (!path)
+    {
+        return;
+    }
+
+    key = g_strdup (path);
+    key_start = key;
+    new_path = g_strdup (path);
+    new_path_start = new_path;
+    path_length = strlen (key);
 
     if (strchr (key, '/'))
     {
