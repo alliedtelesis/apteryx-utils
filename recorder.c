@@ -2356,6 +2356,8 @@ truncate_record_terminators (const char *path, long chop_extra)
 {
     FILE *f = fopen (path, "r+");
     CU_ASSERT_PTR_NOT_NULL_FATAL (f);
+    if (!f)
+        return;
     fseek (f, 0, SEEK_END);
     long size = ftell (f);
     char *buf = malloc (size + 1);
