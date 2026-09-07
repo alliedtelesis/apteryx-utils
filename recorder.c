@@ -725,12 +725,26 @@ resolve_absolute_path (const char *path)
 
     /* If there is no file, resolve parent directory, then append name */
     char *path_copy = strdup (path);
-    char *resolved_dir = realpath (dirname (path_copy), NULL);
+    char *resolved_dir = path_copy ? realpath (dirname (path_copy), NULL) : NULL;
     free (path_copy);
+    if (!resolved_dir)
+    {
+        return NULL;
+    }
 
     path_copy = strdup (path);
-    char *result = malloc (strlen (resolved_dir) + strlen (basename (path_copy)) + 2);
-    sprintf (result, "%s/%s", resolved_dir, basename (path_copy));
+    if (!path_copy)
+    {
+        free (resolved_dir);
+        return NULL;
+    }
+
+    char *base = basename (path_copy);
+    char *result = malloc (strlen (resolved_dir) + strlen (base) + 2);
+    if (result)
+    {
+        sprintf (result, "%s/%s", resolved_dir, base);
+    }
 
     free (path_copy);
     free (resolved_dir);
