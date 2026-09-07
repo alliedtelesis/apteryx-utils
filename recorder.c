@@ -1209,6 +1209,11 @@ initialise_config (json_t *data,
     }
 
     config_data *config = calloc (1, sizeof (config_data));
+    if (!config)
+    {
+        fprintf (stderr, "error: out of memory reading config\n");
+        return -1;
+    }
     g_mutex_init (&config->mutex);
     g_cond_init (&config->cond);
 
