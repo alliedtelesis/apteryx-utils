@@ -539,14 +539,6 @@ append_diff_entry_to_file (const char *path, json_t *diff_entry)
         fprintf (f, ",\n    %s\n  ]\n}\n", entry_str);
     }
 
-    long new_end = ftell (f);
-    if (ftruncate (fileno (f), new_end) != 0) // Redundant safety net.
-    {
-        free (entry_str);
-        fclose (f);
-        return -1;
-    }
-
     free (entry_str);
     fclose (f);
     return 0;
